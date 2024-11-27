@@ -88,6 +88,16 @@
     },
     "Cyclops": {
       "Package": "Cyclops",
+      "Version": "3.5.0",
+      "Source": "GitHub",
+      "RemoteType": "github",
+      "RemoteHost": "api.github.com",
+      "RemoteUsername": "OHDSI",
+      "RemoteRepo": "Cyclops",
+      "RemoteRef": "v3.5.0"
+    },
+    "Cyclops": {
+      "Package": "Cyclops",
       "Version": "3.4.1",
       "Source": "Repository",
       "Repository": "CRAN"
