@@ -14,15 +14,15 @@ ROhdsiWebApi::authorizeWebApi(
   baseUrl = baseUrl,
   authMethod = "windows"
 )
+
 cohortDefinitionSet <- ROhdsiWebApi::exportCohortDefinitionSet(
   baseUrl = baseUrl,
   cohortIds = c(
-    19020, # GLP-1
-    19021, # DPP-4
-    19022, # Type 2 diabetes
-    19023, # Acute myocardial infarction inpatient setting
-    19024, # Acute myocardial infarction any setting
-    19059  # Diarrhea
+    19025, # ACE inhibitors
+    19027, # Thiazides and thiazide-like diuretics
+    19026, # Hypertension
+    19028, # Angioedema
+    19029  # Acute myocardial infarction
   ),
   generateStats = TRUE
 )
@@ -31,7 +31,7 @@ readr::write_csv(cohortDefinitionSet, "inst/Cohorts.csv")
 
 # Download and save the covariates to exclude
 covariatesToExcludeConceptSet <- ROhdsiWebApi::getConceptSetDefinition(
-  conceptSetId = 436,
+  conceptSetId = 9023,
   baseUrl = baseUrl
 ) %>%
   ROhdsiWebApi::resolveConceptSet(
@@ -40,12 +40,7 @@ covariatesToExcludeConceptSet <- ROhdsiWebApi::getConceptSetDefinition(
   ROhdsiWebApi::getConcepts(
     baseUrl = baseUrl
   ) # %>%
-#   rename(outcomeConceptId = "conceptId",
-#          cohortName = "conceptName") %>%
-#   mutate(cohortId = row_number() + 100) %>%
-#   select(cohortId, cohortName, outcomeConceptId)
 
-# NOTE: Update file location for your study.
 CohortGenerator::writeCsv(
   x = covariatesToExcludeConceptSet,
   file = "inst/excludedCovariateConcepts.csv",
@@ -54,7 +49,7 @@ CohortGenerator::writeCsv(
 
 # Download and save the negative control outcomes
 negativeControlOutcomeCohortSet <- ROhdsiWebApi::getConceptSetDefinition(
-  conceptSetId = 437,
+  conceptSetId = 9024,
   baseUrl = baseUrl
 ) %>%
   ROhdsiWebApi::resolveConceptSet(
@@ -68,7 +63,6 @@ negativeControlOutcomeCohortSet <- ROhdsiWebApi::getConceptSetDefinition(
   mutate(cohortId = row_number() + 10000) %>%
   select(cohortId, cohortName, outcomeConceptId)
 
-# NOTE: Update file location for your study.
 CohortGenerator::writeCsv(
   x = negativeControlOutcomeCohortSet,
   file = "inst/negativeControlOutcomes.csv",

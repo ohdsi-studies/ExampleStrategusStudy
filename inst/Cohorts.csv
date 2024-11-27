@@ -1,796 +1,5 @@
 atlasId,cohortId,cohortName,sql,json,logicDescription,generateStats
-19020,19020,[OHDSItutorial] GLP1RA exposures,"CREATE TABLE #Codesets (
-  codeset_id int NOT NULL,
-  concept_id bigint NOT NULL
-)
-;
-
-INSERT INTO #Codesets (codeset_id, concept_id)
-SELECT 1 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (45774435,44816332,40170911,793143,1583722,44506754)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (45774435,44816332,40170911,793143,1583722,44506754)
-  and c.invalid_reason is null
-
-) I
-) C;
-
-UPDATE STATISTICS #Codesets;
-
-
-SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
-INTO #qualified_events
-FROM 
-(
-  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM (-- Begin Primary Events
-select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
-FROM
-(
-  select E.person_id, E.start_date, E.end_date,
-         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
-         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM 
-  (
-  -- Begin Drug Exposure Criteria
-select C.person_id, C.drug_exposure_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id,C.start_date as sort_date
-from 
-(
-  select de.person_id,de.drug_exposure_id,de.drug_concept_id,de.visit_occurrence_id,days_supply,quantity,refills,de.drug_exposure_start_date as start_date, COALESCE(de.drug_exposure_end_date, DATEADD(day,de.days_supply,de.drug_exposure_start_date), DATEADD(day,1,de.drug_exposure_start_date)) as end_date 
-  FROM @cdm_database_schema.DRUG_EXPOSURE de
-JOIN #Codesets cs on (de.drug_concept_id = cs.concept_id and cs.codeset_id = 1)
-) C
-
-
--- End Drug Exposure Criteria
-
-  ) E
-	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
-  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
-) P
-
--- End Primary Events
-) pe
-  
-) QE
-
-;
-
---- Inclusion Rule Inserts
-
-create table #inclusion_events (inclusion_rule_id bigint,
-	person_id bigint,
-	event_id bigint
-);
-
-select event_id, person_id, start_date, end_date, op_start_date, op_end_date
-into #included_events
-FROM (
-  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
-  from
-  (
-    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
-    from #qualified_events Q
-    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
-    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
-  ) MG -- matching groups
-
-) Results
-
-;
-
--- custom era strategy
-
-with ctePersons(person_id) as (
-	select distinct person_id from #included_events
-)
-
-select person_id, drug_exposure_start_date, drug_exposure_end_date
-INTO #drugTarget
-FROM (
-	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
-	FROM @cdm_database_schema.DRUG_EXPOSURE de
-	JOIN ctePersons p on de.person_id = p.person_id
-	JOIN #Codesets cs on cs.codeset_id = 1 AND de.drug_concept_id = cs.concept_id
-
-	UNION ALL
-
-	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
-	FROM @cdm_database_schema.DRUG_EXPOSURE de
-	JOIN ctePersons p on de.person_id = p.person_id
-	JOIN #Codesets cs on cs.codeset_id = 1 AND de.drug_source_concept_id = cs.concept_id
-) E
-;
-
-select et.event_id, et.person_id, ERAS.era_end_date as end_date
-INTO #strategy_ends
-from #included_events et
-JOIN 
-(
-  select ENDS.person_id, min(drug_exposure_start_date) as era_start_date, DATEADD(day,0, ENDS.era_end_date) as era_end_date
-  from
-  (
-    select de.person_id, de.drug_exposure_start_date, MIN(e.END_DATE) as era_end_date
-    FROM #drugTarget DE
-    JOIN 
-    (
-      --cteEndDates
-      select PERSON_ID, DATEADD(day,-1 * 30,EVENT_DATE) as END_DATE -- unpad the end date by 30
-      FROM
-      (
-				select PERSON_ID, EVENT_DATE, EVENT_TYPE, 
-				MAX(START_ORDINAL) OVER (PARTITION BY PERSON_ID ORDER BY event_date, event_type, START_ORDINAL ROWS UNBOUNDED PRECEDING) AS start_ordinal,
-				ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY EVENT_DATE, EVENT_TYPE, START_ORDINAL) AS OVERALL_ORD -- this re-numbers the inner UNION so all rows are numbered ordered by the event date
-				from
-				(
-					-- select the start dates, assigning a row number to each
-					Select PERSON_ID, DRUG_EXPOSURE_START_DATE AS EVENT_DATE, 0 as EVENT_TYPE, ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY DRUG_EXPOSURE_START_DATE) as START_ORDINAL
-					from #drugTarget D
-
-					UNION ALL
-
-					-- add the end dates with NULL as the row number, padding the end dates by 30 to allow a grace period for overlapping ranges.
-					select PERSON_ID, DATEADD(day,30,DRUG_EXPOSURE_END_DATE), 1 as EVENT_TYPE, NULL
-					FROM #drugTarget D
-				) RAWDATA
-      ) E
-      WHERE 2 * E.START_ORDINAL - E.OVERALL_ORD = 0
-    ) E on DE.PERSON_ID = E.PERSON_ID and E.END_DATE >= DE.DRUG_EXPOSURE_START_DATE
-    GROUP BY de.person_id, de.drug_exposure_start_date
-  ) ENDS
-  GROUP BY ENDS.person_id, ENDS.era_end_date
-) ERAS on ERAS.person_id = et.person_id 
-WHERE et.start_date between ERAS.era_start_date and ERAS.era_end_date;
-
-TRUNCATE TABLE #drugTarget;
-DROP TABLE #drugTarget;
-
-
--- generate cohort periods into #final_cohort
-select person_id, start_date, end_date
-INTO #cohort_rows
-from ( -- first_ends
-	select F.person_id, F.start_date, F.end_date
-	FROM (
-	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
-	  from #included_events I
-	  join ( -- cohort_ends
--- cohort exit dates
--- By default, cohort exit at the event's op end date
-select event_id, person_id, op_end_date as end_date from #included_events
-UNION ALL
--- End Date Strategy
-SELECT event_id, person_id, end_date from #strategy_ends
-
-    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
-	) F
-	WHERE F.ordinal = 1
-) FE;
-
-select person_id, min(start_date) as start_date, end_date
-into #final_cohort
-from ( --cteEnds
-	SELECT
-		 c.person_id
-		, c.start_date
-		, MIN(ed.end_date) AS end_date
-	FROM #cohort_rows c
-	JOIN ( -- cteEndDates
-    SELECT
-      person_id
-      , DATEADD(day,-1 * 0, event_date)  as end_date
-    FROM
-    (
-      SELECT
-        person_id
-        , event_date
-        , event_type
-        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
-      FROM
-      (
-        SELECT
-          person_id
-          , start_date AS event_date
-          , -1 AS event_type
-        FROM #cohort_rows
-
-        UNION ALL
-
-
-        SELECT
-          person_id
-          , DATEADD(day,0,end_date) as end_date
-          , 1 AS event_type
-        FROM #cohort_rows
-      ) RAWDATA
-    ) e
-    WHERE interval_status = 0
-  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
-	GROUP BY c.person_id, c.start_date
-) e
-group by person_id, end_date
-;
-
-DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
-INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
-select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
-FROM #final_cohort CO
-;
-
-
--- BEGIN: Censored Stats
-
-delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
-
--- END: Censored Stats
-
-
-
-TRUNCATE TABLE #strategy_ends;
-DROP TABLE #strategy_ends;
-
-
-TRUNCATE TABLE #cohort_rows;
-DROP TABLE #cohort_rows;
-
-TRUNCATE TABLE #final_cohort;
-DROP TABLE #final_cohort;
-
-TRUNCATE TABLE #inclusion_events;
-DROP TABLE #inclusion_events;
-
-TRUNCATE TABLE #qualified_events;
-DROP TABLE #qualified_events;
-
-TRUNCATE TABLE #included_events;
-DROP TABLE #included_events;
-
-TRUNCATE TABLE #Codesets;
-DROP TABLE #Codesets;
-","{
-	""cdmVersionRange"" : "">=5.0.0"",
-	""PrimaryCriteria"" : {
-		""CriteriaList"" : [
-			{
-				""DrugExposure"" : {
-					""CodesetId"" : 1,
-					""DrugTypeExclude"" : false
-				}
-			}
-		],
-		""ObservationWindow"" : {
-			""PriorDays"" : 0,
-			""PostDays"" : 0
-		},
-		""PrimaryCriteriaLimit"" : {
-			""Type"" : ""All""
-		}
-	},
-	""ConceptSets"" : [
-		{
-			""id"" : 1,
-			""name"" : ""GLP-1 receptor antagonists"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 45774435,
-							""CONCEPT_NAME"" : ""dulaglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1551291"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 44816332,
-							""CONCEPT_NAME"" : ""albiglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1534763"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40170911,
-							""CONCEPT_NAME"" : ""liraglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""475968"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 793143,
-							""CONCEPT_NAME"" : ""semaglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1991302"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1583722,
-							""CONCEPT_NAME"" : ""exenatide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""60548"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 44506754,
-							""CONCEPT_NAME"" : ""lixisenatide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1440051"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		}
-	],
-	""QualifiedLimit"" : {
-		""Type"" : ""First""
-	},
-	""ExpressionLimit"" : {
-		""Type"" : ""All""
-	},
-	""InclusionRules"" : [],
-	""EndStrategy"" : {
-		""CustomEra"" : {
-			""DrugCodesetId"" : 1,
-			""GapDays"" : 30,
-			""Offset"" : 0
-		}
-	},
-	""CensoringCriteria"" : [],
-	""CollapseSettings"" : {
-		""CollapseType"" : ""ERA"",
-		""EraPad"" : 0
-	},
-	""CensorWindow"" : {}
-}",NA,TRUE
-19021,19021,[OHDSItutorial] DPP4i exposures,"CREATE TABLE #Codesets (
-  codeset_id int NOT NULL,
-  concept_id bigint NOT NULL
-)
-;
-
-INSERT INTO #Codesets (codeset_id, concept_id)
-SELECT 1 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (40166035,40239216,43013884,19122137,1580747)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (40166035,40239216,43013884,19122137,1580747)
-  and c.invalid_reason is null
-
-) I
-) C;
-
-UPDATE STATISTICS #Codesets;
-
-
-SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
-INTO #qualified_events
-FROM 
-(
-  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM (-- Begin Primary Events
-select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
-FROM
-(
-  select E.person_id, E.start_date, E.end_date,
-         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
-         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM 
-  (
-  -- Begin Drug Exposure Criteria
-select C.person_id, C.drug_exposure_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id,C.start_date as sort_date
-from 
-(
-  select de.person_id,de.drug_exposure_id,de.drug_concept_id,de.visit_occurrence_id,days_supply,quantity,refills,de.drug_exposure_start_date as start_date, COALESCE(de.drug_exposure_end_date, DATEADD(day,de.days_supply,de.drug_exposure_start_date), DATEADD(day,1,de.drug_exposure_start_date)) as end_date 
-  FROM @cdm_database_schema.DRUG_EXPOSURE de
-JOIN #Codesets cs on (de.drug_concept_id = cs.concept_id and cs.codeset_id = 1)
-) C
-
-
--- End Drug Exposure Criteria
-
-  ) E
-	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
-  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
-) P
-
--- End Primary Events
-) pe
-  
-) QE
-
-;
-
---- Inclusion Rule Inserts
-
-create table #inclusion_events (inclusion_rule_id bigint,
-	person_id bigint,
-	event_id bigint
-);
-
-select event_id, person_id, start_date, end_date, op_start_date, op_end_date
-into #included_events
-FROM (
-  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
-  from
-  (
-    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
-    from #qualified_events Q
-    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
-    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
-  ) MG -- matching groups
-
-) Results
-
-;
-
--- custom era strategy
-
-with ctePersons(person_id) as (
-	select distinct person_id from #included_events
-)
-
-select person_id, drug_exposure_start_date, drug_exposure_end_date
-INTO #drugTarget
-FROM (
-	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
-	FROM @cdm_database_schema.DRUG_EXPOSURE de
-	JOIN ctePersons p on de.person_id = p.person_id
-	JOIN #Codesets cs on cs.codeset_id = 1 AND de.drug_concept_id = cs.concept_id
-
-	UNION ALL
-
-	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
-	FROM @cdm_database_schema.DRUG_EXPOSURE de
-	JOIN ctePersons p on de.person_id = p.person_id
-	JOIN #Codesets cs on cs.codeset_id = 1 AND de.drug_source_concept_id = cs.concept_id
-) E
-;
-
-select et.event_id, et.person_id, ERAS.era_end_date as end_date
-INTO #strategy_ends
-from #included_events et
-JOIN 
-(
-  select ENDS.person_id, min(drug_exposure_start_date) as era_start_date, DATEADD(day,0, ENDS.era_end_date) as era_end_date
-  from
-  (
-    select de.person_id, de.drug_exposure_start_date, MIN(e.END_DATE) as era_end_date
-    FROM #drugTarget DE
-    JOIN 
-    (
-      --cteEndDates
-      select PERSON_ID, DATEADD(day,-1 * 30,EVENT_DATE) as END_DATE -- unpad the end date by 30
-      FROM
-      (
-				select PERSON_ID, EVENT_DATE, EVENT_TYPE, 
-				MAX(START_ORDINAL) OVER (PARTITION BY PERSON_ID ORDER BY event_date, event_type, START_ORDINAL ROWS UNBOUNDED PRECEDING) AS start_ordinal,
-				ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY EVENT_DATE, EVENT_TYPE, START_ORDINAL) AS OVERALL_ORD -- this re-numbers the inner UNION so all rows are numbered ordered by the event date
-				from
-				(
-					-- select the start dates, assigning a row number to each
-					Select PERSON_ID, DRUG_EXPOSURE_START_DATE AS EVENT_DATE, 0 as EVENT_TYPE, ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY DRUG_EXPOSURE_START_DATE) as START_ORDINAL
-					from #drugTarget D
-
-					UNION ALL
-
-					-- add the end dates with NULL as the row number, padding the end dates by 30 to allow a grace period for overlapping ranges.
-					select PERSON_ID, DATEADD(day,30,DRUG_EXPOSURE_END_DATE), 1 as EVENT_TYPE, NULL
-					FROM #drugTarget D
-				) RAWDATA
-      ) E
-      WHERE 2 * E.START_ORDINAL - E.OVERALL_ORD = 0
-    ) E on DE.PERSON_ID = E.PERSON_ID and E.END_DATE >= DE.DRUG_EXPOSURE_START_DATE
-    GROUP BY de.person_id, de.drug_exposure_start_date
-  ) ENDS
-  GROUP BY ENDS.person_id, ENDS.era_end_date
-) ERAS on ERAS.person_id = et.person_id 
-WHERE et.start_date between ERAS.era_start_date and ERAS.era_end_date;
-
-TRUNCATE TABLE #drugTarget;
-DROP TABLE #drugTarget;
-
-
--- generate cohort periods into #final_cohort
-select person_id, start_date, end_date
-INTO #cohort_rows
-from ( -- first_ends
-	select F.person_id, F.start_date, F.end_date
-	FROM (
-	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
-	  from #included_events I
-	  join ( -- cohort_ends
--- cohort exit dates
--- By default, cohort exit at the event's op end date
-select event_id, person_id, op_end_date as end_date from #included_events
-UNION ALL
--- End Date Strategy
-SELECT event_id, person_id, end_date from #strategy_ends
-
-    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
-	) F
-	WHERE F.ordinal = 1
-) FE;
-
-select person_id, min(start_date) as start_date, end_date
-into #final_cohort
-from ( --cteEnds
-	SELECT
-		 c.person_id
-		, c.start_date
-		, MIN(ed.end_date) AS end_date
-	FROM #cohort_rows c
-	JOIN ( -- cteEndDates
-    SELECT
-      person_id
-      , DATEADD(day,-1 * 0, event_date)  as end_date
-    FROM
-    (
-      SELECT
-        person_id
-        , event_date
-        , event_type
-        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
-      FROM
-      (
-        SELECT
-          person_id
-          , start_date AS event_date
-          , -1 AS event_type
-        FROM #cohort_rows
-
-        UNION ALL
-
-
-        SELECT
-          person_id
-          , DATEADD(day,0,end_date) as end_date
-          , 1 AS event_type
-        FROM #cohort_rows
-      ) RAWDATA
-    ) e
-    WHERE interval_status = 0
-  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
-	GROUP BY c.person_id, c.start_date
-) e
-group by person_id, end_date
-;
-
-DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
-INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
-select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
-FROM #final_cohort CO
-;
-
-
--- BEGIN: Censored Stats
-
-delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
-
--- END: Censored Stats
-
-
-
-TRUNCATE TABLE #strategy_ends;
-DROP TABLE #strategy_ends;
-
-
-TRUNCATE TABLE #cohort_rows;
-DROP TABLE #cohort_rows;
-
-TRUNCATE TABLE #final_cohort;
-DROP TABLE #final_cohort;
-
-TRUNCATE TABLE #inclusion_events;
-DROP TABLE #inclusion_events;
-
-TRUNCATE TABLE #qualified_events;
-DROP TABLE #qualified_events;
-
-TRUNCATE TABLE #included_events;
-DROP TABLE #included_events;
-
-TRUNCATE TABLE #Codesets;
-DROP TABLE #Codesets;
-","{
-	""cdmVersionRange"" : "">=5.0.0"",
-	""PrimaryCriteria"" : {
-		""CriteriaList"" : [
-			{
-				""DrugExposure"" : {
-					""CodesetId"" : 1,
-					""DrugTypeExclude"" : false
-				}
-			}
-		],
-		""ObservationWindow"" : {
-			""PriorDays"" : 0,
-			""PostDays"" : 0
-		},
-		""PrimaryCriteriaLimit"" : {
-			""Type"" : ""All""
-		}
-	},
-	""ConceptSets"" : [
-		{
-			""id"" : 1,
-			""name"" : ""DPP4 Inhibitors"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40166035,
-							""CONCEPT_NAME"" : ""saxagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""857974"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40239216,
-							""CONCEPT_NAME"" : ""linagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1100699"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 43013884,
-							""CONCEPT_NAME"" : ""alogliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1368001"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19122137,
-							""CONCEPT_NAME"" : ""vildagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""596554"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1580747,
-							""CONCEPT_NAME"" : ""sitagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""593411"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		}
-	],
-	""QualifiedLimit"" : {
-		""Type"" : ""First""
-	},
-	""ExpressionLimit"" : {
-		""Type"" : ""All""
-	},
-	""InclusionRules"" : [],
-	""EndStrategy"" : {
-		""CustomEra"" : {
-			""DrugCodesetId"" : 1,
-			""GapDays"" : 30,
-			""Offset"" : 0
-		}
-	},
-	""CensoringCriteria"" : [],
-	""CollapseSettings"" : {
-		""CollapseType"" : ""ERA"",
-		""EraPad"" : 0
-	},
-	""CensorWindow"" : {}
-}",NA,TRUE
-19022,19022,"[OHDSItutorial] Earliest event of Type 2 Diabetes Mellitus (DM), with no type 1 or secondary DM","CREATE TABLE #Codesets (
+19025,19025,[OHDSIAPAC2024Tutorial] ACE inhibitor exposures,"CREATE TABLE #Codesets (
   codeset_id int NOT NULL,
   concept_id bigint NOT NULL
 )
@@ -799,73 +8,854 @@ DROP TABLE #Codesets;
 INSERT INTO #Codesets (codeset_id, concept_id)
 SELECT 0 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
 ( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (443238,201820,442793)
+  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (1335471,1340128,1341927,1363749,1308216,1310756,1373225,1331235,1334456,1342439)
 UNION  select c.concept_id
   from @vocabulary_database_schema.CONCEPT c
   join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (443238,201820,442793)
+  and ca.ancestor_concept_id in (1335471,1340128,1341927,1363749,1308216,1310756,1373225,1331235,1334456,1342439)
   and c.invalid_reason is null
 
 ) I
-LEFT JOIN
+) C;
+
+UPDATE STATISTICS #Codesets;
+
+
+SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
+INTO #qualified_events
+FROM 
 (
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (40484648,201254,435216,201254,195771,4058243,761051)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (40484648,201254,435216,201254,195771,4058243,761051)
-  and c.invalid_reason is null
+  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
+  FROM (-- Begin Primary Events
+select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
+FROM
+(
+  select E.person_id, E.start_date, E.end_date,
+         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
+         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
+  FROM 
+  (
+  -- Begin Drug Exposure Criteria
+select C.person_id, C.drug_exposure_id as event_id, C.start_date, C.end_date,
+  C.visit_occurrence_id,C.start_date as sort_date
+from 
+(
+  select de.person_id,de.drug_exposure_id,de.drug_concept_id,de.visit_occurrence_id,days_supply,quantity,refills,de.drug_exposure_start_date as start_date, COALESCE(de.drug_exposure_end_date, DATEADD(day,de.days_supply,de.drug_exposure_start_date), DATEADD(day,1,de.drug_exposure_start_date)) as end_date 
+  FROM @cdm_database_schema.DRUG_EXPOSURE de
+JOIN #Codesets cs on (de.drug_concept_id = cs.concept_id and cs.codeset_id = 0)
+) C
 
-) E ON I.concept_id = E.concept_id
-WHERE E.concept_id is null
-) C UNION ALL 
-SELECT 2 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
+
+-- End Drug Exposure Criteria
+
+  ) E
+	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
+  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
+) P
+
+-- End Primary Events
+) pe
+  
+) QE
+
+;
+
+--- Inclusion Rule Inserts
+
+create table #inclusion_events (inclusion_rule_id bigint,
+	person_id bigint,
+	event_id bigint
+);
+
+select event_id, person_id, start_date, end_date, op_start_date, op_end_date
+into #included_events
+FROM (
+  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
+  from
+  (
+    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
+    from #qualified_events Q
+    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
+    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
+  ) MG -- matching groups
+
+) Results
+
+;
+
+-- custom era strategy
+
+with ctePersons(person_id) as (
+	select distinct person_id from #included_events
+)
+
+select person_id, drug_exposure_start_date, drug_exposure_end_date
+INTO #drugTarget
+FROM (
+	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
+	FROM @cdm_database_schema.DRUG_EXPOSURE de
+	JOIN ctePersons p on de.person_id = p.person_id
+	JOIN #Codesets cs on cs.codeset_id = 0 AND de.drug_concept_id = cs.concept_id
+
+	UNION ALL
+
+	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
+	FROM @cdm_database_schema.DRUG_EXPOSURE de
+	JOIN ctePersons p on de.person_id = p.person_id
+	JOIN #Codesets cs on cs.codeset_id = 0 AND de.drug_source_concept_id = cs.concept_id
+) E
+;
+
+select et.event_id, et.person_id, ERAS.era_end_date as end_date
+INTO #strategy_ends
+from #included_events et
+JOIN 
+(
+  select ENDS.person_id, min(drug_exposure_start_date) as era_start_date, DATEADD(day,0, ENDS.era_end_date) as era_end_date
+  from
+  (
+    select de.person_id, de.drug_exposure_start_date, MIN(e.END_DATE) as era_end_date
+    FROM #drugTarget DE
+    JOIN 
+    (
+      --cteEndDates
+      select PERSON_ID, DATEADD(day,-1 * 90,EVENT_DATE) as END_DATE -- unpad the end date by 90
+      FROM
+      (
+				select PERSON_ID, EVENT_DATE, EVENT_TYPE, 
+				MAX(START_ORDINAL) OVER (PARTITION BY PERSON_ID ORDER BY event_date, event_type, START_ORDINAL ROWS UNBOUNDED PRECEDING) AS start_ordinal,
+				ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY EVENT_DATE, EVENT_TYPE, START_ORDINAL) AS OVERALL_ORD -- this re-numbers the inner UNION so all rows are numbered ordered by the event date
+				from
+				(
+					-- select the start dates, assigning a row number to each
+					Select PERSON_ID, DRUG_EXPOSURE_START_DATE AS EVENT_DATE, 0 as EVENT_TYPE, ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY DRUG_EXPOSURE_START_DATE) as START_ORDINAL
+					from #drugTarget D
+
+					UNION ALL
+
+					-- add the end dates with NULL as the row number, padding the end dates by 90 to allow a grace period for overlapping ranges.
+					select PERSON_ID, DATEADD(day,90,DRUG_EXPOSURE_END_DATE), 1 as EVENT_TYPE, NULL
+					FROM #drugTarget D
+				) RAWDATA
+      ) E
+      WHERE 2 * E.START_ORDINAL - E.OVERALL_ORD = 0
+    ) E on DE.PERSON_ID = E.PERSON_ID and E.END_DATE >= DE.DRUG_EXPOSURE_START_DATE
+    GROUP BY de.person_id, de.drug_exposure_start_date
+  ) ENDS
+  GROUP BY ENDS.person_id, ENDS.era_end_date
+) ERAS on ERAS.person_id = et.person_id 
+WHERE et.start_date between ERAS.era_start_date and ERAS.era_end_date;
+
+TRUNCATE TABLE #drugTarget;
+DROP TABLE #drugTarget;
+
+
+-- generate cohort periods into #final_cohort
+select person_id, start_date, end_date
+INTO #cohort_rows
+from ( -- first_ends
+	select F.person_id, F.start_date, F.end_date
+	FROM (
+	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
+	  from #included_events I
+	  join ( -- cohort_ends
+-- cohort exit dates
+-- By default, cohort exit at the event's op end date
+select event_id, person_id, op_end_date as end_date from #included_events
+UNION ALL
+-- End Date Strategy
+SELECT event_id, person_id, end_date from #strategy_ends
+
+    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
+	) F
+	WHERE F.ordinal = 1
+) FE;
+
+select person_id, min(start_date) as start_date, end_date
+into #final_cohort
+from ( --cteEnds
+	SELECT
+		 c.person_id
+		, c.start_date
+		, MIN(ed.end_date) AS end_date
+	FROM #cohort_rows c
+	JOIN ( -- cteEndDates
+    SELECT
+      person_id
+      , DATEADD(day,-1 * 0, event_date)  as end_date
+    FROM
+    (
+      SELECT
+        person_id
+        , event_date
+        , event_type
+        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
+      FROM
+      (
+        SELECT
+          person_id
+          , start_date AS event_date
+          , -1 AS event_type
+        FROM #cohort_rows
+
+        UNION ALL
+
+
+        SELECT
+          person_id
+          , DATEADD(day,0,end_date) as end_date
+          , 1 AS event_type
+        FROM #cohort_rows
+      ) RAWDATA
+    ) e
+    WHERE interval_status = 0
+  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
+	GROUP BY c.person_id, c.start_date
+) e
+group by person_id, end_date
+;
+
+DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
+INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
+select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
+FROM #final_cohort CO
+;
+
+
+-- BEGIN: Censored Stats
+
+delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
+
+-- END: Censored Stats
+
+
+
+TRUNCATE TABLE #strategy_ends;
+DROP TABLE #strategy_ends;
+
+
+TRUNCATE TABLE #cohort_rows;
+DROP TABLE #cohort_rows;
+
+TRUNCATE TABLE #final_cohort;
+DROP TABLE #final_cohort;
+
+TRUNCATE TABLE #inclusion_events;
+DROP TABLE #inclusion_events;
+
+TRUNCATE TABLE #qualified_events;
+DROP TABLE #qualified_events;
+
+TRUNCATE TABLE #included_events;
+DROP TABLE #included_events;
+
+TRUNCATE TABLE #Codesets;
+DROP TABLE #Codesets;
+","{
+	""cdmVersionRange"" : "">=5.0.0"",
+	""PrimaryCriteria"" : {
+		""CriteriaList"" : [
+			{
+				""DrugExposure"" : {
+					""CodesetId"" : 0,
+					""DrugTypeExclude"" : false
+				}
+			}
+		],
+		""ObservationWindow"" : {
+			""PriorDays"" : 0,
+			""PostDays"" : 0
+		},
+		""PrimaryCriteriaLimit"" : {
+			""Type"" : ""All""
+		}
+	},
+	""ConceptSets"" : [
+		{
+			""id"" : 0,
+			""name"" : ""ACE inhibitors"",
+			""expression"" : {
+				""items"" : [
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1335471,
+							""CONCEPT_NAME"" : ""benazepril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""18867"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1340128,
+							""CONCEPT_NAME"" : ""captopril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""1998"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1341927,
+							""CONCEPT_NAME"" : ""enalapril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""3827"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1363749,
+							""CONCEPT_NAME"" : ""fosinopril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""50166"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1308216,
+							""CONCEPT_NAME"" : ""lisinopril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""29046"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1310756,
+							""CONCEPT_NAME"" : ""moexipril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""30131"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1373225,
+							""CONCEPT_NAME"" : ""perindopril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""54552"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1331235,
+							""CONCEPT_NAME"" : ""quinapril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""35208"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1334456,
+							""CONCEPT_NAME"" : ""ramipril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""35296"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1342439,
+							""CONCEPT_NAME"" : ""trandolapril"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""38454"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					}
+				]
+			}
+		}
+	],
+	""QualifiedLimit"" : {
+		""Type"" : ""First""
+	},
+	""ExpressionLimit"" : {
+		""Type"" : ""All""
+	},
+	""InclusionRules"" : [],
+	""EndStrategy"" : {
+		""CustomEra"" : {
+			""DrugCodesetId"" : 0,
+			""GapDays"" : 90,
+			""Offset"" : 0
+		}
+	},
+	""CensoringCriteria"" : [],
+	""CollapseSettings"" : {
+		""CollapseType"" : ""ERA"",
+		""EraPad"" : 0
+	},
+	""CensorWindow"" : {}
+}",NA,TRUE
+19027,19027,[OHDSIAPAC2024Tutorial] Thiazide diuretics exposures,"CREATE TABLE #Codesets (
+  codeset_id int NOT NULL,
+  concept_id bigint NOT NULL
+)
+;
+
+INSERT INTO #Codesets (codeset_id, concept_id)
+SELECT 0 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
 ( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (195771)
+  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (1395058,974166,978555,907013)
 UNION  select c.concept_id
   from @vocabulary_database_schema.CONCEPT c
   join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (195771)
+  and ca.ancestor_concept_id in (1395058,974166,978555,907013)
   and c.invalid_reason is null
 
 ) I
-) C UNION ALL 
-SELECT 3 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
+) C;
+
+UPDATE STATISTICS #Codesets;
+
+
+SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
+INTO #qualified_events
+FROM 
+(
+  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
+  FROM (-- Begin Primary Events
+select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
+FROM
+(
+  select E.person_id, E.start_date, E.end_date,
+         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
+         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
+  FROM 
+  (
+  -- Begin Drug Exposure Criteria
+select C.person_id, C.drug_exposure_id as event_id, C.start_date, C.end_date,
+  C.visit_occurrence_id,C.start_date as sort_date
+from 
+(
+  select de.person_id,de.drug_exposure_id,de.drug_concept_id,de.visit_occurrence_id,days_supply,quantity,refills,de.drug_exposure_start_date as start_date, COALESCE(de.drug_exposure_end_date, DATEADD(day,de.days_supply,de.drug_exposure_start_date), DATEADD(day,1,de.drug_exposure_start_date)) as end_date 
+  FROM @cdm_database_schema.DRUG_EXPOSURE de
+JOIN #Codesets cs on (de.drug_concept_id = cs.concept_id and cs.codeset_id = 0)
+) C
+
+
+-- End Drug Exposure Criteria
+
+  ) E
+	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
+  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
+) P
+
+-- End Primary Events
+) pe
+  
+) QE
+
+;
+
+--- Inclusion Rule Inserts
+
+create table #inclusion_events (inclusion_rule_id bigint,
+	person_id bigint,
+	event_id bigint
+);
+
+select event_id, person_id, start_date, end_date, op_start_date, op_end_date
+into #included_events
+FROM (
+  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
+  from
+  (
+    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
+    from #qualified_events Q
+    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
+    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
+  ) MG -- matching groups
+
+) Results
+
+;
+
+-- custom era strategy
+
+with ctePersons(person_id) as (
+	select distinct person_id from #included_events
+)
+
+select person_id, drug_exposure_start_date, drug_exposure_end_date
+INTO #drugTarget
+FROM (
+	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
+	FROM @cdm_database_schema.DRUG_EXPOSURE de
+	JOIN ctePersons p on de.person_id = p.person_id
+	JOIN #Codesets cs on cs.codeset_id = 0 AND de.drug_concept_id = cs.concept_id
+
+	UNION ALL
+
+	select de.PERSON_ID, DRUG_EXPOSURE_START_DATE, COALESCE(DRUG_EXPOSURE_END_DATE, DATEADD(day,DAYS_SUPPLY,DRUG_EXPOSURE_START_DATE), DATEADD(day,1,DRUG_EXPOSURE_START_DATE)) as DRUG_EXPOSURE_END_DATE 
+	FROM @cdm_database_schema.DRUG_EXPOSURE de
+	JOIN ctePersons p on de.person_id = p.person_id
+	JOIN #Codesets cs on cs.codeset_id = 0 AND de.drug_source_concept_id = cs.concept_id
+) E
+;
+
+select et.event_id, et.person_id, ERAS.era_end_date as end_date
+INTO #strategy_ends
+from #included_events et
+JOIN 
+(
+  select ENDS.person_id, min(drug_exposure_start_date) as era_start_date, DATEADD(day,0, ENDS.era_end_date) as era_end_date
+  from
+  (
+    select de.person_id, de.drug_exposure_start_date, MIN(e.END_DATE) as era_end_date
+    FROM #drugTarget DE
+    JOIN 
+    (
+      --cteEndDates
+      select PERSON_ID, DATEADD(day,-1 * 90,EVENT_DATE) as END_DATE -- unpad the end date by 90
+      FROM
+      (
+				select PERSON_ID, EVENT_DATE, EVENT_TYPE, 
+				MAX(START_ORDINAL) OVER (PARTITION BY PERSON_ID ORDER BY event_date, event_type, START_ORDINAL ROWS UNBOUNDED PRECEDING) AS start_ordinal,
+				ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY EVENT_DATE, EVENT_TYPE, START_ORDINAL) AS OVERALL_ORD -- this re-numbers the inner UNION so all rows are numbered ordered by the event date
+				from
+				(
+					-- select the start dates, assigning a row number to each
+					Select PERSON_ID, DRUG_EXPOSURE_START_DATE AS EVENT_DATE, 0 as EVENT_TYPE, ROW_NUMBER() OVER (PARTITION BY PERSON_ID ORDER BY DRUG_EXPOSURE_START_DATE) as START_ORDINAL
+					from #drugTarget D
+
+					UNION ALL
+
+					-- add the end dates with NULL as the row number, padding the end dates by 90 to allow a grace period for overlapping ranges.
+					select PERSON_ID, DATEADD(day,90,DRUG_EXPOSURE_END_DATE), 1 as EVENT_TYPE, NULL
+					FROM #drugTarget D
+				) RAWDATA
+      ) E
+      WHERE 2 * E.START_ORDINAL - E.OVERALL_ORD = 0
+    ) E on DE.PERSON_ID = E.PERSON_ID and E.END_DATE >= DE.DRUG_EXPOSURE_START_DATE
+    GROUP BY de.person_id, de.drug_exposure_start_date
+  ) ENDS
+  GROUP BY ENDS.person_id, ENDS.era_end_date
+) ERAS on ERAS.person_id = et.person_id 
+WHERE et.start_date between ERAS.era_start_date and ERAS.era_end_date;
+
+TRUNCATE TABLE #drugTarget;
+DROP TABLE #drugTarget;
+
+
+-- generate cohort periods into #final_cohort
+select person_id, start_date, end_date
+INTO #cohort_rows
+from ( -- first_ends
+	select F.person_id, F.start_date, F.end_date
+	FROM (
+	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
+	  from #included_events I
+	  join ( -- cohort_ends
+-- cohort exit dates
+-- By default, cohort exit at the event's op end date
+select event_id, person_id, op_end_date as end_date from #included_events
+UNION ALL
+-- End Date Strategy
+SELECT event_id, person_id, end_date from #strategy_ends
+
+    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
+	) F
+	WHERE F.ordinal = 1
+) FE;
+
+select person_id, min(start_date) as start_date, end_date
+into #final_cohort
+from ( --cteEnds
+	SELECT
+		 c.person_id
+		, c.start_date
+		, MIN(ed.end_date) AS end_date
+	FROM #cohort_rows c
+	JOIN ( -- cteEndDates
+    SELECT
+      person_id
+      , DATEADD(day,-1 * 0, event_date)  as end_date
+    FROM
+    (
+      SELECT
+        person_id
+        , event_date
+        , event_type
+        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
+      FROM
+      (
+        SELECT
+          person_id
+          , start_date AS event_date
+          , -1 AS event_type
+        FROM #cohort_rows
+
+        UNION ALL
+
+
+        SELECT
+          person_id
+          , DATEADD(day,0,end_date) as end_date
+          , 1 AS event_type
+        FROM #cohort_rows
+      ) RAWDATA
+    ) e
+    WHERE interval_status = 0
+  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
+	GROUP BY c.person_id, c.start_date
+) e
+group by person_id, end_date
+;
+
+DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
+INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
+select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
+FROM #final_cohort CO
+;
+
+
+-- BEGIN: Censored Stats
+
+delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
+
+-- END: Censored Stats
+
+
+
+TRUNCATE TABLE #strategy_ends;
+DROP TABLE #strategy_ends;
+
+
+TRUNCATE TABLE #cohort_rows;
+DROP TABLE #cohort_rows;
+
+TRUNCATE TABLE #final_cohort;
+DROP TABLE #final_cohort;
+
+TRUNCATE TABLE #inclusion_events;
+DROP TABLE #inclusion_events;
+
+TRUNCATE TABLE #qualified_events;
+DROP TABLE #qualified_events;
+
+TRUNCATE TABLE #included_events;
+DROP TABLE #included_events;
+
+TRUNCATE TABLE #Codesets;
+DROP TABLE #Codesets;
+","{
+	""cdmVersionRange"" : "">=5.0.0"",
+	""PrimaryCriteria"" : {
+		""CriteriaList"" : [
+			{
+				""DrugExposure"" : {
+					""CodesetId"" : 0,
+					""DrugTypeExclude"" : false
+				}
+			}
+		],
+		""ObservationWindow"" : {
+			""PriorDays"" : 0,
+			""PostDays"" : 0
+		},
+		""PrimaryCriteriaLimit"" : {
+			""Type"" : ""All""
+		}
+	},
+	""ConceptSets"" : [
+		{
+			""id"" : 0,
+			""name"" : ""Thiazide or thiazide-like diuretics"",
+			""expression"" : {
+				""items"" : [
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 1395058,
+							""CONCEPT_NAME"" : ""chlorthalidone"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""2409"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 974166,
+							""CONCEPT_NAME"" : ""hydrochlorothiazide"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""5487"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 978555,
+							""CONCEPT_NAME"" : ""indapamide"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""5764"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 907013,
+							""CONCEPT_NAME"" : ""metolazone"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""6916"",
+							""DOMAIN_ID"" : ""Drug"",
+							""VOCABULARY_ID"" : ""RxNorm"",
+							""CONCEPT_CLASS_ID"" : ""Ingredient""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					}
+				]
+			}
+		}
+	],
+	""QualifiedLimit"" : {
+		""Type"" : ""First""
+	},
+	""ExpressionLimit"" : {
+		""Type"" : ""All""
+	},
+	""InclusionRules"" : [],
+	""EndStrategy"" : {
+		""CustomEra"" : {
+			""DrugCodesetId"" : 0,
+			""GapDays"" : 90,
+			""Offset"" : 0
+		}
+	},
+	""CensoringCriteria"" : [],
+	""CollapseSettings"" : {
+		""CollapseType"" : ""ERA"",
+		""EraPad"" : 0
+	},
+	""CensorWindow"" : {}
+}",NA,TRUE
+19026,19026,[OHDSIAPAC2024Tutorial] Hypertension,"CREATE TABLE #Codesets (
+  codeset_id int NOT NULL,
+  concept_id bigint NOT NULL
+)
+;
+
+INSERT INTO #Codesets (codeset_id, concept_id)
+SELECT 0 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
 ( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (4184637,3004410,3003309,3005673,3007263,40762352)
+  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (316866,442604,44782429,201313)
 UNION  select c.concept_id
   from @vocabulary_database_schema.CONCEPT c
   join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (4184637,3004410,3003309,3005673,3007263,40762352)
+  and ca.ancestor_concept_id in (316866,442604,44782429,201313)
   and c.invalid_reason is null
-
-) I
-) C UNION ALL 
-SELECT 4 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (1529331,1530014,44816332,43013884,19035533,43526465,19033498,1594973,44785829,45774435,45774751,793293,1583722,19001409,19059796,1597756,1560171,19097821,1559684,19001441,1000979,40239216,40170911,44506754,1503297,1510202,1502826,19033909,1525215,1517998,1516766,1547504,40166035,793143,1580747,1502809,1502855,1515249,19122137)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (1529331,1530014,44816332,43013884,19035533,43526465,19033498,1594973,44785829,45774435,45774751,793293,1583722,19001409,19059796,1597756,1560171,19097821,1559684,19001441,1000979,40239216,40170911,44506754,1503297,1510202,1502826,19033909,1525215,1517998,1516766,1547504,40166035,793143,1580747,1502809,1502855,1515249,19122137)
-  and c.invalid_reason is null
-
-) I
-) C UNION ALL 
-SELECT 5 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (40484649,42689695,765533,43531006,765650,45770986,201254,45768456,40484648,4128019,435216)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (40484649,42689695,765533,43531006,765650,45770986,201254,45768456,40484648,4128019,435216)
-  and c.invalid_reason is null
-
-) I
-) C UNION ALL 
-SELECT 6 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (1340204)
 
 ) I
 ) C;
@@ -899,64 +889,6 @@ FROM
 
 
 -- End Condition Occurrence Criteria
-
-UNION ALL
--- Begin Drug Exposure Criteria
-select C.person_id, C.drug_exposure_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id,C.start_date as sort_date
-from 
-(
-  select de.person_id,de.drug_exposure_id,de.drug_concept_id,de.visit_occurrence_id,days_supply,quantity,refills,de.drug_exposure_start_date as start_date, COALESCE(de.drug_exposure_end_date, DATEADD(day,de.days_supply,de.drug_exposure_start_date), DATEADD(day,1,de.drug_exposure_start_date)) as end_date 
-  FROM @cdm_database_schema.DRUG_EXPOSURE de
-JOIN #Codesets cs on (de.drug_concept_id = cs.concept_id and cs.codeset_id = 4)
-) C
-
-
--- End Drug Exposure Criteria
-
-UNION ALL
--- Begin Measurement Criteria
-select C.person_id, C.measurement_id as event_id, C.start_date, C.end_date,
-       C.visit_occurrence_id, C.start_date as sort_date
-from 
-(
-  select m.person_id,m.measurement_id,m.measurement_concept_id,m.visit_occurrence_id,m.value_as_number,m.range_high,m.range_low,m.unit_concept_id,m.measurement_date as start_date, DATEADD(day,1,m.measurement_date) as end_date 
-  FROM @cdm_database_schema.MEASUREMENT m
-JOIN #Codesets cs on (m.measurement_concept_id = cs.concept_id and cs.codeset_id = 3)
-) C
-
-WHERE (C.value_as_number >= 6.5000 and C.value_as_number <= 30.0000)
-AND C.unit_concept_id in (8554)
--- End Measurement Criteria
-
-UNION ALL
--- Begin Measurement Criteria
-select C.person_id, C.measurement_id as event_id, C.start_date, C.end_date,
-       C.visit_occurrence_id, C.start_date as sort_date
-from 
-(
-  select m.person_id,m.measurement_id,m.measurement_concept_id,m.visit_occurrence_id,m.value_as_number,m.range_high,m.range_low,m.unit_concept_id,m.measurement_date as start_date, DATEADD(day,1,m.measurement_date) as end_date 
-  FROM @cdm_database_schema.MEASUREMENT m
-JOIN #Codesets cs on (m.measurement_concept_id = cs.concept_id and cs.codeset_id = 3)
-) C
-
-WHERE (C.value_as_number >= 48.0000 and C.value_as_number <= 99.0000)
-AND C.unit_concept_id in (9579)
--- End Measurement Criteria
-
-UNION ALL
--- Begin Observation Criteria
-select C.person_id, C.observation_id as event_id, C.start_date, C.END_DATE,
-       C.visit_occurrence_id, C.start_date as sort_date
-from 
-(
-  select o.person_id,o.observation_id,o.observation_concept_id,o.visit_occurrence_id,o.value_as_number,o.value_as_concept_id,o.observation_date as start_date, DATEADD(day,1,o.observation_date) as end_date 
-  FROM @cdm_database_schema.OBSERVATION o
-JOIN #Codesets cs on (o.observation_concept_id = cs.concept_id and cs.codeset_id = 6)
-) C
-
-WHERE C.value_as_concept_id in (4184637)
--- End Observation Criteria
 
   ) E
 	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
@@ -972,170 +904,10 @@ WHERE P.ordinal = 1
 
 --- Inclusion Rule Inserts
 
-select 0 as inclusion_rule_id, person_id, event_id
-INTO #Inclusion_0
-FROM 
-(
-  select pe.person_id, pe.event_id
-  FROM #qualified_events pe
-  
-JOIN (
--- Begin Criteria Group
-select 0 as index_id, person_id, event_id
-FROM
-(
-  select E.person_id, E.event_id 
-  FROM #qualified_events E
-  INNER JOIN
-  (
-    -- Begin Correlated Criteria
-select 0 as index_id, p.person_id, p.event_id
-from #qualified_events p
-LEFT JOIN (
-SELECT p.person_id, p.event_id 
-FROM #qualified_events P
-JOIN (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 5)
-) C
-
-
--- End Condition Occurrence Criteria
-
-) A on A.person_id = P.person_id  AND A.START_DATE <= DATEADD(day,0,P.START_DATE) ) cc on p.person_id = cc.person_id and p.event_id = cc.event_id
-GROUP BY p.person_id, p.event_id
-HAVING COUNT(cc.event_id) = 0
--- End Correlated Criteria
-
-  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
-  GROUP BY E.person_id, E.event_id
-  HAVING COUNT(index_id) = 1
-) G
--- End Criteria Group
-) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
-) Results
-;
-
-select 1 as inclusion_rule_id, person_id, event_id
-INTO #Inclusion_1
-FROM 
-(
-  select pe.person_id, pe.event_id
-  FROM #qualified_events pe
-  
-JOIN (
--- Begin Criteria Group
-select 0 as index_id, person_id, event_id
-FROM
-(
-  select E.person_id, E.event_id 
-  FROM #qualified_events E
-  INNER JOIN
-  (
-    -- Begin Correlated Criteria
-select 0 as index_id, p.person_id, p.event_id
-from #qualified_events p
-LEFT JOIN (
-SELECT p.person_id, p.event_id 
-FROM #qualified_events P
-JOIN (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 2)
-) C
-
-
--- End Condition Occurrence Criteria
-
-) A on A.person_id = P.person_id  AND A.START_DATE <= DATEADD(day,0,P.START_DATE) ) cc on p.person_id = cc.person_id and p.event_id = cc.event_id
-GROUP BY p.person_id, p.event_id
-HAVING COUNT(cc.event_id) = 0
--- End Correlated Criteria
-
-  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
-  GROUP BY E.person_id, E.event_id
-  HAVING COUNT(index_id) = 1
-) G
--- End Criteria Group
-) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
-) Results
-;
-
-select 2 as inclusion_rule_id, person_id, event_id
-INTO #Inclusion_2
-FROM 
-(
-  select pe.person_id, pe.event_id
-  FROM #qualified_events pe
-  
-JOIN (
--- Begin Criteria Group
-select 0 as index_id, person_id, event_id
-FROM
-(
-  select E.person_id, E.event_id 
-  FROM #qualified_events E
-  INNER JOIN
-  (
-    -- Begin Correlated Criteria
-select 0 as index_id, cc.person_id, cc.event_id
-from (SELECT p.person_id, p.event_id 
-FROM #qualified_events P
-JOIN (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 0)
-) C
-
-
--- End Condition Occurrence Criteria
-
-) A on A.person_id = P.person_id  AND A.START_DATE >= P.OP_START_DATE AND A.START_DATE <= P.OP_END_DATE AND A.START_DATE >= DATEADD(day,0,P.START_DATE) AND A.START_DATE <= DATEADD(day,365,P.START_DATE) ) cc 
-GROUP BY cc.person_id, cc.event_id
-HAVING COUNT(cc.event_id) >= 1
--- End Correlated Criteria
-
-  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
-  GROUP BY E.person_id, E.event_id
-  HAVING COUNT(index_id) = 1
-) G
--- End Criteria Group
-) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
-) Results
-;
-
-SELECT inclusion_rule_id, person_id, event_id
-INTO #inclusion_events
-FROM (select inclusion_rule_id, person_id, event_id from #Inclusion_0
-UNION ALL
-select inclusion_rule_id, person_id, event_id from #Inclusion_1
-UNION ALL
-select inclusion_rule_id, person_id, event_id from #Inclusion_2) I;
-TRUNCATE TABLE #Inclusion_0;
-DROP TABLE #Inclusion_0;
-
-TRUNCATE TABLE #Inclusion_1;
-DROP TABLE #Inclusion_1;
-
-TRUNCATE TABLE #Inclusion_2;
-DROP TABLE #Inclusion_2;
-
+create table #inclusion_events (inclusion_rule_id bigint,
+	person_id bigint,
+	event_id bigint
+);
 
 select event_id, person_id, start_date, end_date, op_start_date, op_end_date
 into #included_events
@@ -1148,9 +920,6 @@ FROM (
     LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
     GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
   ) MG -- matching groups
-
-  -- the matching group with all bits set ( POWER(2,# of inclusion rules) - 1 = inclusion_rule_mask
-  WHERE (MG.inclusion_rule_mask = POWER(cast(2 as bigint),3)-1)
 
 ) Results
 WHERE Results.ordinal = 1
@@ -1234,12 +1003,429 @@ delete from @results_database_schema.cohort_censor_stats where cohort_definition
 
 
 
+
+
+TRUNCATE TABLE #cohort_rows;
+DROP TABLE #cohort_rows;
+
+TRUNCATE TABLE #final_cohort;
+DROP TABLE #final_cohort;
+
+TRUNCATE TABLE #inclusion_events;
+DROP TABLE #inclusion_events;
+
+TRUNCATE TABLE #qualified_events;
+DROP TABLE #qualified_events;
+
+TRUNCATE TABLE #included_events;
+DROP TABLE #included_events;
+
+TRUNCATE TABLE #Codesets;
+DROP TABLE #Codesets;
+","{
+	""cdmVersionRange"" : "">=5.0.0"",
+	""PrimaryCriteria"" : {
+		""CriteriaList"" : [
+			{
+				""ConditionOccurrence"" : {
+					""CodesetId"" : 0
+				}
+			}
+		],
+		""ObservationWindow"" : {
+			""PriorDays"" : 0,
+			""PostDays"" : 0
+		},
+		""PrimaryCriteriaLimit"" : {
+			""Type"" : ""First""
+		}
+	},
+	""ConceptSets"" : [
+		{
+			""id"" : 0,
+			""name"" : ""hypertension"",
+			""expression"" : {
+				""items"" : [
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 316866,
+							""CONCEPT_NAME"" : ""Hypertensive disorder"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""38341003"",
+							""DOMAIN_ID"" : ""Condition"",
+							""VOCABULARY_ID"" : ""SNOMED"",
+							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 442604,
+							""CONCEPT_NAME"" : ""Hypertensive heart disease"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""64715009"",
+							""DOMAIN_ID"" : ""Condition"",
+							""VOCABULARY_ID"" : ""SNOMED"",
+							""CONCEPT_CLASS_ID"" : ""Disorder""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 44782429,
+							""CONCEPT_NAME"" : ""Chronic kidney disease due to hypertension"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""104931000119100"",
+							""DOMAIN_ID"" : ""Condition"",
+							""VOCABULARY_ID"" : ""SNOMED"",
+							""CONCEPT_CLASS_ID"" : ""Disorder""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 201313,
+							""CONCEPT_NAME"" : ""Hypertensive renal disease"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""38481006"",
+							""DOMAIN_ID"" : ""Condition"",
+							""VOCABULARY_ID"" : ""SNOMED"",
+							""CONCEPT_CLASS_ID"" : ""Disorder""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					}
+				]
+			}
+		}
+	],
+	""QualifiedLimit"" : {
+		""Type"" : ""First""
+	},
+	""ExpressionLimit"" : {
+		""Type"" : ""First""
+	},
+	""InclusionRules"" : [],
+	""CensoringCriteria"" : [],
+	""CollapseSettings"" : {
+		""CollapseType"" : ""ERA"",
+		""EraPad"" : 0
+	},
+	""CensorWindow"" : {}
+}",NA,TRUE
+19028,19028,"[OHDSIAPAC2024Tutorial] All events of Angioedema, with a washout period of 180 days","CREATE TABLE #Codesets (
+  codeset_id int NOT NULL,
+  concept_id bigint NOT NULL
+)
+;
+
+INSERT INTO #Codesets (codeset_id, concept_id)
+SELECT 3 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
+( 
+  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (4296370,432791,4297361,4270861)
+UNION  select c.concept_id
+  from @vocabulary_database_schema.CONCEPT c
+  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
+  and ca.ancestor_concept_id in (4296370,432791,4297361,4270861)
+  and c.invalid_reason is null
+
+) I
+) C UNION ALL 
+SELECT 10 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
+( 
+  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (4296370,432791)
+UNION  select c.concept_id
+  from @vocabulary_database_schema.CONCEPT c
+  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
+  and ca.ancestor_concept_id in (4296370,432791)
+  and c.invalid_reason is null
+
+) I
+) C;
+
+UPDATE STATISTICS #Codesets;
+
+
+SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
+INTO #qualified_events
+FROM 
+(
+  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
+  FROM (-- Begin Primary Events
+select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
+FROM
+(
+  select E.person_id, E.start_date, E.end_date,
+         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
+         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
+  FROM 
+  (
+  -- Begin Condition Occurrence Criteria
+SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
+  C.visit_occurrence_id, C.start_date as sort_date
+FROM 
+(
+  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
+  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
+  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 3)
+) C
+
+
+-- End Condition Occurrence Criteria
+
+  ) E
+	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
+  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
+) P
+
+-- End Primary Events
+) pe
+  
+) QE
+
+;
+
+--- Inclusion Rule Inserts
+
+select 0 as inclusion_rule_id, person_id, event_id
+INTO #Inclusion_0
+FROM 
+(
+  select pe.person_id, pe.event_id
+  FROM #qualified_events pe
+  
+JOIN (
+-- Begin Criteria Group
+select 0 as index_id, person_id, event_id
+FROM
+(
+  select E.person_id, E.event_id 
+  FROM #qualified_events E
+  INNER JOIN
+  (
+    -- Begin Correlated Criteria
+select 0 as index_id, cc.person_id, cc.event_id
+from (SELECT p.person_id, p.event_id 
+FROM #qualified_events P
+JOIN (
+  -- Begin Condition Occurrence Criteria
+SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
+  C.visit_occurrence_id, C.start_date as sort_date
+FROM 
+(
+  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
+  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
+  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 10)
+) C
+
+
+-- End Condition Occurrence Criteria
+
+) A on A.person_id = P.person_id  AND A.START_DATE >= P.OP_START_DATE AND A.START_DATE <= P.OP_END_DATE AND A.START_DATE >= DATEADD(day,0,P.START_DATE) AND A.START_DATE <= DATEADD(day,3,P.START_DATE) ) cc 
+GROUP BY cc.person_id, cc.event_id
+HAVING COUNT(cc.event_id) >= 1
+-- End Correlated Criteria
+
+  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
+  GROUP BY E.person_id, E.event_id
+  HAVING COUNT(index_id) = 1
+) G
+-- End Criteria Group
+) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
+) Results
+;
+
+select 1 as inclusion_rule_id, person_id, event_id
+INTO #Inclusion_1
+FROM 
+(
+  select pe.person_id, pe.event_id
+  FROM #qualified_events pe
+  
+JOIN (
+-- Begin Criteria Group
+select 0 as index_id, person_id, event_id
+FROM
+(
+  select E.person_id, E.event_id 
+  FROM #qualified_events E
+  INNER JOIN
+  (
+    -- Begin Correlated Criteria
+select 0 as index_id, p.person_id, p.event_id
+from #qualified_events p
+LEFT JOIN (
+SELECT p.person_id, p.event_id 
+FROM #qualified_events P
+JOIN (
+  -- Begin Condition Occurrence Criteria
+SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
+  C.visit_occurrence_id, C.start_date as sort_date
+FROM 
+(
+  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
+  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
+  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 10)
+) C
+
+
+-- End Condition Occurrence Criteria
+
+) A on A.person_id = P.person_id  AND A.START_DATE >= P.OP_START_DATE AND A.START_DATE <= P.OP_END_DATE AND A.START_DATE >= DATEADD(day,-180,P.START_DATE) AND A.START_DATE <= DATEADD(day,-1,P.START_DATE) ) cc on p.person_id = cc.person_id and p.event_id = cc.event_id
+GROUP BY p.person_id, p.event_id
+HAVING COUNT(cc.event_id) = 0
+-- End Correlated Criteria
+
+  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
+  GROUP BY E.person_id, E.event_id
+  HAVING COUNT(index_id) = 1
+) G
+-- End Criteria Group
+) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
+) Results
+;
+
+SELECT inclusion_rule_id, person_id, event_id
+INTO #inclusion_events
+FROM (select inclusion_rule_id, person_id, event_id from #Inclusion_0
+UNION ALL
+select inclusion_rule_id, person_id, event_id from #Inclusion_1) I;
+TRUNCATE TABLE #Inclusion_0;
+DROP TABLE #Inclusion_0;
+
+TRUNCATE TABLE #Inclusion_1;
+DROP TABLE #Inclusion_1;
+
+
+select event_id, person_id, start_date, end_date, op_start_date, op_end_date
+into #included_events
+FROM (
+  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
+  from
+  (
+    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
+    from #qualified_events Q
+    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
+    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
+  ) MG -- matching groups
+
+  -- the matching group with all bits set ( POWER(2,# of inclusion rules) - 1 = inclusion_rule_mask
+  WHERE (MG.inclusion_rule_mask = POWER(cast(2 as bigint),2)-1)
+
+) Results
+
+;
+
+-- date offset strategy
+
+select event_id, person_id, 
+  case when DATEADD(day,1,end_date) > op_end_date then op_end_date else DATEADD(day,1,end_date) end as end_date
+INTO #strategy_ends
+from #included_events;
+
+
+-- generate cohort periods into #final_cohort
+select person_id, start_date, end_date
+INTO #cohort_rows
+from ( -- first_ends
+	select F.person_id, F.start_date, F.end_date
+	FROM (
+	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
+	  from #included_events I
+	  join ( -- cohort_ends
+-- cohort exit dates
+-- End Date Strategy
+SELECT event_id, person_id, end_date from #strategy_ends
+
+    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
+	) F
+	WHERE F.ordinal = 1
+) FE;
+
+select person_id, min(start_date) as start_date, end_date
+into #final_cohort
+from ( --cteEnds
+	SELECT
+		 c.person_id
+		, c.start_date
+		, MIN(ed.end_date) AS end_date
+	FROM #cohort_rows c
+	JOIN ( -- cteEndDates
+    SELECT
+      person_id
+      , DATEADD(day,-1 * 0, event_date)  as end_date
+    FROM
+    (
+      SELECT
+        person_id
+        , event_date
+        , event_type
+        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
+      FROM
+      (
+        SELECT
+          person_id
+          , start_date AS event_date
+          , -1 AS event_type
+        FROM #cohort_rows
+
+        UNION ALL
+
+
+        SELECT
+          person_id
+          , DATEADD(day,0,end_date) as end_date
+          , 1 AS event_type
+        FROM #cohort_rows
+      ) RAWDATA
+    ) e
+    WHERE interval_status = 0
+  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
+	GROUP BY c.person_id, c.start_date
+) e
+group by person_id, end_date
+;
+
+DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
+INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
+select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
+FROM #final_cohort CO
+;
+
+
+-- BEGIN: Censored Stats
+
+delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
+
+-- END: Censored Stats
+
+
+
 -- Create a temp table of inclusion rule rows for joining in the inclusion rule impact analysis
 
 select cast(rule_sequence as int) as rule_sequence
 into #inclusion_rules
 from (
-  SELECT CAST(0 as int) as rule_sequence UNION ALL SELECT CAST(1 as int) as rule_sequence UNION ALL SELECT CAST(2 as int) as rule_sequence
+  SELECT CAST(0 as int) as rule_sequence UNION ALL SELECT CAST(1 as int) as rule_sequence
 ) IR;
 
 
@@ -1368,6 +1554,8 @@ TRUNCATE TABLE #inclusion_rules;
 DROP TABLE #inclusion_rules;
 
 
+TRUNCATE TABLE #strategy_ends;
+DROP TABLE #strategy_ends;
 
 
 TRUNCATE TABLE #cohort_rows;
@@ -1393,83 +1581,7 @@ DROP TABLE #Codesets;
 		""CriteriaList"" : [
 			{
 				""ConditionOccurrence"" : {
-					""CodesetId"" : 0
-				}
-			},
-			{
-				""DrugExposure"" : {
-					""CodesetId"" : 4,
-					""DrugTypeExclude"" : false
-				}
-			},
-			{
-				""Measurement"" : {
-					""CodesetId"" : 3,
-					""MeasurementTypeExclude"" : false,
-					""ValueAsNumber"" : {
-						""Value"" : 6.5,
-						""Op"" : ""bt"",
-						""Extent"" : 30
-					},
-					""Unit"" : [
-						{
-							""CONCEPT_ID"" : 8554,
-							""CONCEPT_NAME"" : ""percent"",
-							""STANDARD_CONCEPT"" : null,
-							""STANDARD_CONCEPT_CAPTION"" : ""Unknown"",
-							""INVALID_REASON"" : null,
-							""INVALID_REASON_CAPTION"" : ""Unknown"",
-							""CONCEPT_CODE"" : ""%"",
-							""DOMAIN_ID"" : ""Unit"",
-							""VOCABULARY_ID"" : ""UCUM"",
-							""CONCEPT_CLASS_ID"" : null
-						}
-					]
-				}
-			},
-			{
-				""Measurement"" : {
-					""CodesetId"" : 3,
-					""MeasurementTypeExclude"" : false,
-					""ValueAsNumber"" : {
-						""Value"" : 48,
-						""Op"" : ""bt"",
-						""Extent"" : 99
-					},
-					""Unit"" : [
-						{
-							""CONCEPT_ID"" : 9579,
-							""CONCEPT_NAME"" : ""millimole per mole"",
-							""STANDARD_CONCEPT"" : null,
-							""STANDARD_CONCEPT_CAPTION"" : ""Unknown"",
-							""INVALID_REASON"" : null,
-							""INVALID_REASON_CAPTION"" : ""Unknown"",
-							""CONCEPT_CODE"" : ""mmol/mol"",
-							""DOMAIN_ID"" : ""Unit"",
-							""VOCABULARY_ID"" : ""UCUM"",
-							""CONCEPT_CLASS_ID"" : null
-						}
-					]
-				}
-			},
-			{
-				""Observation"" : {
-					""CodesetId"" : 6,
-					""ObservationTypeExclude"" : false,
-					""ValueAsConcept"" : [
-						{
-							""CONCEPT_ID"" : 4184637,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c measurement"",
-							""STANDARD_CONCEPT"" : null,
-							""STANDARD_CONCEPT_CAPTION"" : ""Unknown"",
-							""INVALID_REASON"" : null,
-							""INVALID_REASON_CAPTION"" : ""Unknown"",
-							""CONCEPT_CODE"" : ""43396009"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : null
-						}
-					]
+					""CodesetId"" : 3
 				}
 			}
 		],
@@ -1478,1008 +1590,24 @@ DROP TABLE #Codesets;
 			""PostDays"" : 0
 		},
 		""PrimaryCriteriaLimit"" : {
-			""Type"" : ""First""
+			""Type"" : ""All""
 		}
 	},
 	""ConceptSets"" : [
 		{
-			""id"" : 0,
-			""name"" : ""Type 2 diabetes mellitus (diabetes mellitus excluding T1DM and secondary)"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 443238,
-							""CONCEPT_NAME"" : ""Diabetic - poor control"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""268519009"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 201820,
-							""CONCEPT_NAME"" : ""Diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""73211009"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 442793,
-							""CONCEPT_NAME"" : ""Complication due to diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""74627003"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40484648,
-							""CONCEPT_NAME"" : ""Type 1 diabetes mellitus uncontrolled"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""444073006"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 201254,
-							""CONCEPT_NAME"" : ""Type 1 diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""46635009"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 435216,
-							""CONCEPT_NAME"" : ""Disorder due to type 1 diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""420868002"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 201254,
-							""CONCEPT_NAME"" : ""Type 1 diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""46635009"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 195771,
-							""CONCEPT_NAME"" : ""Secondary diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""8801005"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4058243,
-							""CONCEPT_NAME"" : ""Diabetes mellitus during pregnancy, childbirth and the puerperium"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""199223000"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 761051,
-							""CONCEPT_NAME"" : ""Complication due to secondary diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""138811000119100"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		},
-		{
-			""id"" : 2,
-			""name"" : ""Secondary diabetes mellitus"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 195771,
-							""CONCEPT_NAME"" : ""Secondary diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""8801005"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		},
-		{
 			""id"" : 3,
-			""name"" : ""Hemoglobin A1c (HbA1c) measurements"",
+			""name"" : ""Angioedema or urticaria"",
 			""expression"" : {
 				""items"" : [
 					{
 						""concept"" : {
-							""CONCEPT_ID"" : 4184637,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c measurement"",
+							""CONCEPT_ID"" : 4296370,
+							""CONCEPT_NAME"" : ""Cutis laxa following urticaria-angioedema"",
 							""STANDARD_CONCEPT"" : ""S"",
 							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
 							""INVALID_REASON"" : ""V"",
 							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""43396009"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Procedure""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 3004410,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c/Hemoglobin.total in Blood"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""4548-4"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""LOINC"",
-							""CONCEPT_CLASS_ID"" : ""Lab Test""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 3003309,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c/Hemoglobin.total in Blood by Electrophoresis"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""4549-2"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""LOINC"",
-							""CONCEPT_CLASS_ID"" : ""Lab Test""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 3005673,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c/Hemoglobin.total in Blood by HPLC"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""17856-6"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""LOINC"",
-							""CONCEPT_CLASS_ID"" : ""Lab Test""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 3007263,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c/Hemoglobin.total in Blood by calculation"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""17855-8"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""LOINC"",
-							""CONCEPT_CLASS_ID"" : ""Lab Test""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40762352,
-							""CONCEPT_NAME"" : ""Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""59261-8"",
-							""DOMAIN_ID"" : ""Measurement"",
-							""VOCABULARY_ID"" : ""LOINC"",
-							""CONCEPT_CLASS_ID"" : ""Lab Test""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		},
-		{
-			""id"" : 4,
-			""name"" : ""Blood glucose lowering drugs, excluding insulin"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1529331,
-							""CONCEPT_NAME"" : ""acarbose"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""16681"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1530014,
-							""CONCEPT_NAME"" : ""acetohexamide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""173"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 44816332,
-							""CONCEPT_NAME"" : ""albiglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1534763"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 43013884,
-							""CONCEPT_NAME"" : ""alogliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1368001"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19035533,
-							""CONCEPT_NAME"" : ""benfluorex"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""18880"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 43526465,
-							""CONCEPT_NAME"" : ""canagliflozin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1373458"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19033498,
-							""CONCEPT_NAME"" : ""carbutamide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""2068"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1594973,
-							""CONCEPT_NAME"" : ""chlorpropamide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""2404"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 44785829,
-							""CONCEPT_NAME"" : ""dapagliflozin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1488564"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 45774435,
-							""CONCEPT_NAME"" : ""dulaglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1551291"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 45774751,
-							""CONCEPT_NAME"" : ""empagliflozin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1545653"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 793293,
-							""CONCEPT_NAME"" : ""ertugliflozin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1992672"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1583722,
-							""CONCEPT_NAME"" : ""exenatide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""60548"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19001409,
-							""CONCEPT_NAME"" : ""glibornuride"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""102846"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19059796,
-							""CONCEPT_NAME"" : ""gliclazide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""4816"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1597756,
-							""CONCEPT_NAME"" : ""glimepiride"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""25789"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1560171,
-							""CONCEPT_NAME"" : ""glipizide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""4821"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19097821,
-							""CONCEPT_NAME"" : ""gliquidone"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""25793"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1559684,
-							""CONCEPT_NAME"" : ""glyburide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""4815"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19001441,
-							""CONCEPT_NAME"" : ""glymidine"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""102848"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1000979,
-							""CONCEPT_NAME"" : ""guar gum"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""26344"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40239216,
-							""CONCEPT_NAME"" : ""linagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1100699"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40170911,
-							""CONCEPT_NAME"" : ""liraglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""475968"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 44506754,
-							""CONCEPT_NAME"" : ""lixisenatide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1440051"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1503297,
-							""CONCEPT_NAME"" : ""metformin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""6809"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1510202,
-							""CONCEPT_NAME"" : ""miglitol"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""30009"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1502826,
-							""CONCEPT_NAME"" : ""nateglinide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""274332"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19033909,
-							""CONCEPT_NAME"" : ""phenformin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""8129"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1525215,
-							""CONCEPT_NAME"" : ""pioglitazone"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""33738"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1517998,
-							""CONCEPT_NAME"" : ""pramlintide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""139953"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1516766,
-							""CONCEPT_NAME"" : ""repaglinide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""73044"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1547504,
-							""CONCEPT_NAME"" : ""rosiglitazone"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""84108"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40166035,
-							""CONCEPT_NAME"" : ""saxagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""857974"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 793143,
-							""CONCEPT_NAME"" : ""semaglutide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1991302"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1580747,
-							""CONCEPT_NAME"" : ""sitagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""593411"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1502809,
-							""CONCEPT_NAME"" : ""tolazamide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""10633"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1502855,
-							""CONCEPT_NAME"" : ""tolbutamide"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""10635"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 1515249,
-							""CONCEPT_NAME"" : ""troglitazone"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""72610"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 19122137,
-							""CONCEPT_NAME"" : ""vildagliptin"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""596554"",
-							""DOMAIN_ID"" : ""Drug"",
-							""VOCABULARY_ID"" : ""RxNorm"",
-							""CONCEPT_CLASS_ID"" : ""Ingredient""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		},
-		{
-			""id"" : 5,
-			""name"" : ""Type 1 Diabetes Mellitus"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40484649,
-							""CONCEPT_NAME"" : ""Type 1 diabetes mellitus well controlled"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""444074000"",
+							""CONCEPT_CODE"" : ""403398009"",
 							""DOMAIN_ID"" : ""Condition"",
 							""VOCABULARY_ID"" : ""SNOMED"",
 							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
@@ -2490,13 +1618,13 @@ DROP TABLE #Codesets;
 					},
 					{
 						""concept"" : {
-							""CONCEPT_ID"" : 42689695,
-							""CONCEPT_NAME"" : ""Eating disorder co-occurrent with diabetes mellitus type 1"",
+							""CONCEPT_ID"" : 432791,
+							""CONCEPT_NAME"" : ""Angioedema"",
 							""STANDARD_CONCEPT"" : ""S"",
 							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
 							""INVALID_REASON"" : ""V"",
 							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1067201000000106"",
+							""CONCEPT_CODE"" : ""41291007"",
 							""DOMAIN_ID"" : ""Condition"",
 							""VOCABULARY_ID"" : ""SNOMED"",
 							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
@@ -2507,13 +1635,13 @@ DROP TABLE #Codesets;
 					},
 					{
 						""concept"" : {
-							""CONCEPT_ID"" : 765533,
-							""CONCEPT_NAME"" : ""Glaucoma due to diabetes mellitus type 1"",
+							""CONCEPT_ID"" : 4297361,
+							""CONCEPT_NAME"" : ""Angioedema and/or urticaria"",
 							""STANDARD_CONCEPT"" : ""S"",
 							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
 							""INVALID_REASON"" : ""V"",
 							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""60981000119103"",
+							""CONCEPT_CODE"" : ""404177007"",
 							""DOMAIN_ID"" : ""Condition"",
 							""VOCABULARY_ID"" : ""SNOMED"",
 							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
@@ -2524,132 +1652,13 @@ DROP TABLE #Codesets;
 					},
 					{
 						""concept"" : {
-							""CONCEPT_ID"" : 43531006,
-							""CONCEPT_NAME"" : ""Maturity onset diabetes of the young, type 1"",
+							""CONCEPT_ID"" : 4270861,
+							""CONCEPT_NAME"" : ""Allergic angioedema"",
 							""STANDARD_CONCEPT"" : ""S"",
 							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
 							""INVALID_REASON"" : ""V"",
 							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""609562003"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 765650,
-							""CONCEPT_NAME"" : ""Cranial nerve palsy due to diabetes mellitus type 1"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""82561000119101"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 45770986,
-							""CONCEPT_NAME"" : ""Retinopathy due to unstable diabetes mellitus type 1"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""706894000"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 201254,
-							""CONCEPT_NAME"" : ""Type 1 diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""46635009"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 45768456,
-							""CONCEPT_NAME"" : ""Neuropathy due to unstable diabetes mellitus type 1"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""706891008"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 40484648,
-							""CONCEPT_NAME"" : ""Type 1 diabetes mellitus uncontrolled"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""444073006"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4128019,
-							""CONCEPT_NAME"" : ""Brittle type 1 diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""290002008"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 435216,
-							""CONCEPT_NAME"" : ""Disorder due to type 1 diabetes mellitus"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""420868002"",
+							""CONCEPT_CODE"" : ""402387002"",
 							""DOMAIN_ID"" : ""Condition"",
 							""VOCABULARY_ID"" : ""SNOMED"",
 							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
@@ -2662,25 +1671,42 @@ DROP TABLE #Codesets;
 			}
 		},
 		{
-			""id"" : 6,
-			""name"" : ""History of "",
+			""id"" : 10,
+			""name"" : ""Angioedema"",
 			""expression"" : {
 				""items"" : [
 					{
 						""concept"" : {
-							""CONCEPT_ID"" : 1340204,
-							""CONCEPT_NAME"" : ""History of event"",
+							""CONCEPT_ID"" : 4296370,
+							""CONCEPT_NAME"" : ""Cutis laxa following urticaria-angioedema"",
 							""STANDARD_CONCEPT"" : ""S"",
 							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
 							""INVALID_REASON"" : ""V"",
 							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""OMOP5165859"",
-							""DOMAIN_ID"" : ""Observation"",
-							""VOCABULARY_ID"" : ""OMOP Extension"",
-							""CONCEPT_CLASS_ID"" : ""Context-dependent""
+							""CONCEPT_CODE"" : ""403398009"",
+							""DOMAIN_ID"" : ""Condition"",
+							""VOCABULARY_ID"" : ""SNOMED"",
+							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
 						},
 						""isExcluded"" : false,
-						""includeDescendants"" : false,
+						""includeDescendants"" : true,
+						""includeMapped"" : false
+					},
+					{
+						""concept"" : {
+							""CONCEPT_ID"" : 432791,
+							""CONCEPT_NAME"" : ""Angioedema"",
+							""STANDARD_CONCEPT"" : ""S"",
+							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
+							""INVALID_REASON"" : ""V"",
+							""INVALID_REASON_CAPTION"" : ""Valid"",
+							""CONCEPT_CODE"" : ""41291007"",
+							""DOMAIN_ID"" : ""Condition"",
+							""VOCABULARY_ID"" : ""SNOMED"",
+							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
+						},
+						""isExcluded"" : false,
+						""includeDescendants"" : true,
 						""includeMapped"" : false
 					}
 				]
@@ -2688,91 +1714,21 @@ DROP TABLE #Codesets;
 		}
 	],
 	""QualifiedLimit"" : {
-		""Type"" : ""First""
+		""Type"" : ""All""
 	},
 	""ExpressionLimit"" : {
-		""Type"" : ""First""
+		""Type"" : ""All""
 	},
 	""InclusionRules"" : [
 		{
-			""name"" : ""no Type 1 diabetes mellitus diagnosis on or prior to T2DM"",
+			""name"" : ""Angioedema within 3 days  "",
 			""expression"" : {
 				""Type"" : ""ALL"",
 				""CriteriaList"" : [
 					{
 						""Criteria"" : {
 							""ConditionOccurrence"" : {
-								""CodesetId"" : 5
-							}
-						},
-						""StartWindow"" : {
-							""Start"" : {
-								""Coeff"" : -1
-							},
-							""End"" : {
-								""Days"" : 0,
-								""Coeff"" : 1
-							},
-							""UseIndexEnd"" : false,
-							""UseEventEnd"" : false
-						},
-						""RestrictVisit"" : false,
-						""IgnoreObservationPeriod"" : true,
-						""Occurrence"" : {
-							""Type"" : 0,
-							""Count"" : 0,
-							""IsDistinct"" : false
-						}
-					}
-				],
-				""DemographicCriteriaList"" : [],
-				""Groups"" : []
-			}
-		},
-		{
-			""name"" : ""no secondary diabetes diagnosis on or prior to T2DM"",
-			""expression"" : {
-				""Type"" : ""ALL"",
-				""CriteriaList"" : [
-					{
-						""Criteria"" : {
-							""ConditionOccurrence"" : {
-								""CodesetId"" : 2
-							}
-						},
-						""StartWindow"" : {
-							""Start"" : {
-								""Coeff"" : -1
-							},
-							""End"" : {
-								""Days"" : 0,
-								""Coeff"" : 1
-							},
-							""UseIndexEnd"" : false,
-							""UseEventEnd"" : false
-						},
-						""RestrictVisit"" : false,
-						""IgnoreObservationPeriod"" : true,
-						""Occurrence"" : {
-							""Type"" : 0,
-							""Count"" : 0,
-							""IsDistinct"" : false
-						}
-					}
-				],
-				""DemographicCriteriaList"" : [],
-				""Groups"" : []
-			}
-		},
-		{
-			""name"" : ""has at least one diagnosis of T2DM on or within 365d of index date"",
-			""expression"" : {
-				""Type"" : ""ALL"",
-				""CriteriaList"" : [
-					{
-						""Criteria"" : {
-							""ConditionOccurrence"" : {
-								""CodesetId"" : 0
+								""CodesetId"" : 10
 							}
 						},
 						""StartWindow"" : {
@@ -2781,7 +1737,7 @@ DROP TABLE #Codesets;
 								""Coeff"" : -1
 							},
 							""End"" : {
-								""Days"" : 365,
+								""Days"" : 3,
 								""Coeff"" : 1
 							},
 							""UseIndexEnd"" : false,
@@ -2799,8 +1755,50 @@ DROP TABLE #Codesets;
 				""DemographicCriteriaList"" : [],
 				""Groups"" : []
 			}
+		},
+		{
+			""name"" : ""Washout period 180 days"",
+			""expression"" : {
+				""Type"" : ""ALL"",
+				""CriteriaList"" : [
+					{
+						""Criteria"" : {
+							""ConditionOccurrence"" : {
+								""CodesetId"" : 10
+							}
+						},
+						""StartWindow"" : {
+							""Start"" : {
+								""Days"" : 180,
+								""Coeff"" : -1
+							},
+							""End"" : {
+								""Days"" : 1,
+								""Coeff"" : -1
+							},
+							""UseIndexEnd"" : false,
+							""UseEventEnd"" : false
+						},
+						""RestrictVisit"" : false,
+						""IgnoreObservationPeriod"" : false,
+						""Occurrence"" : {
+							""Type"" : 0,
+							""Count"" : 0,
+							""IsDistinct"" : false
+						}
+					}
+				],
+				""DemographicCriteriaList"" : [],
+				""Groups"" : []
+			}
 		}
 	],
+	""EndStrategy"" : {
+		""DateOffset"" : {
+			""DateField"" : ""EndDate"",
+			""Offset"" : 1
+		}
+	},
 	""CensoringCriteria"" : [],
 	""CollapseSettings"" : {
 		""CollapseType"" : ""ERA"",
@@ -2809,7 +1807,7 @@ DROP TABLE #Codesets;
 	""CensorWindow"" : {}
 }","
 ",TRUE
-19023,19023,[OHDSItutorial] All events of Acute Myocardial Infarction inpatient setting with washout of 365d,"CREATE TABLE #Codesets (
+19029,19029,[OHDSIAPAC2024Tutorial] All events of Acute Myocardial Infarction inpatient with washout of 365d,"CREATE TABLE #Codesets (
   codeset_id int NOT NULL,
   concept_id bigint NOT NULL
 )
@@ -3764,1217 +2762,3 @@ DROP TABLE #Codesets;
 	""CensorWindow"" : {}
 }","
 ",TRUE
-19024,19024,[OHDSItutorial] All events of Acute Myocardial Infarction any setting with washout of 365d,"CREATE TABLE #Codesets (
-  codeset_id int NOT NULL,
-  concept_id bigint NOT NULL
-)
-;
-
-INSERT INTO #Codesets (codeset_id, concept_id)
-SELECT 1 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (262,9201)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (262,9201)
-  and c.invalid_reason is null
-
-) I
-) C UNION ALL 
-SELECT 2 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (4329847,4108680,4108678,438172,4124687,45766212,37109910,37109911,37109912)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (4329847,4108680,4108678,438172,4124687,45766212,37109910,37109911,37109912)
-  and c.invalid_reason is null
-
-) I
-LEFT JOIN
-(
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (314666)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (314666)
-  and c.invalid_reason is null
-
-) E ON I.concept_id = E.concept_id
-WHERE E.concept_id is null
-) C;
-
-UPDATE STATISTICS #Codesets;
-
-
-SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
-INTO #qualified_events
-FROM 
-(
-  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM (-- Begin Primary Events
-select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
-FROM
-(
-  select E.person_id, E.start_date, E.end_date,
-         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
-         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM 
-  (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 2)
-) C
-
-
--- End Condition Occurrence Criteria
-
-  ) E
-	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
-  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
-) P
-
--- End Primary Events
-) pe
-  
-) QE
-
-;
-
---- Inclusion Rule Inserts
-
-select 0 as inclusion_rule_id, person_id, event_id
-INTO #Inclusion_0
-FROM 
-(
-  select pe.person_id, pe.event_id
-  FROM #qualified_events pe
-  
-JOIN (
--- Begin Criteria Group
-select 0 as index_id, person_id, event_id
-FROM
-(
-  select E.person_id, E.event_id 
-  FROM #qualified_events E
-  INNER JOIN
-  (
-    -- Begin Correlated Criteria
-select 0 as index_id, p.person_id, p.event_id
-from #qualified_events p
-LEFT JOIN (
-SELECT p.person_id, p.event_id 
-FROM #qualified_events P
-JOIN (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 2)
-) C
-
-
--- End Condition Occurrence Criteria
-
-) A on A.person_id = P.person_id  AND A.START_DATE >= DATEADD(day,-365,P.START_DATE) AND A.START_DATE <= DATEADD(day,-1,P.START_DATE) ) cc on p.person_id = cc.person_id and p.event_id = cc.event_id
-GROUP BY p.person_id, p.event_id
-HAVING COUNT(cc.event_id) = 0
--- End Correlated Criteria
-
-  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
-  GROUP BY E.person_id, E.event_id
-  HAVING COUNT(index_id) = 1
-) G
--- End Criteria Group
-) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
-) Results
-;
-
-SELECT inclusion_rule_id, person_id, event_id
-INTO #inclusion_events
-FROM (select inclusion_rule_id, person_id, event_id from #Inclusion_0) I;
-TRUNCATE TABLE #Inclusion_0;
-DROP TABLE #Inclusion_0;
-
-
-select event_id, person_id, start_date, end_date, op_start_date, op_end_date
-into #included_events
-FROM (
-  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
-  from
-  (
-    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
-    from #qualified_events Q
-    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
-    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
-  ) MG -- matching groups
-
-  -- the matching group with all bits set ( POWER(2,# of inclusion rules) - 1 = inclusion_rule_mask
-  WHERE (MG.inclusion_rule_mask = POWER(cast(2 as bigint),1)-1)
-
-) Results
-
-;
-
--- date offset strategy
-
-select event_id, person_id, 
-  case when DATEADD(day,1,start_date) > op_end_date then op_end_date else DATEADD(day,1,start_date) end as end_date
-INTO #strategy_ends
-from #included_events;
-
-
--- generate cohort periods into #final_cohort
-select person_id, start_date, end_date
-INTO #cohort_rows
-from ( -- first_ends
-	select F.person_id, F.start_date, F.end_date
-	FROM (
-	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
-	  from #included_events I
-	  join ( -- cohort_ends
--- cohort exit dates
--- End Date Strategy
-SELECT event_id, person_id, end_date from #strategy_ends
-
-    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
-	) F
-	WHERE F.ordinal = 1
-) FE;
-
-select person_id, min(start_date) as start_date, end_date
-into #final_cohort
-from ( --cteEnds
-	SELECT
-		 c.person_id
-		, c.start_date
-		, MIN(ed.end_date) AS end_date
-	FROM #cohort_rows c
-	JOIN ( -- cteEndDates
-    SELECT
-      person_id
-      , DATEADD(day,-1 * 0, event_date)  as end_date
-    FROM
-    (
-      SELECT
-        person_id
-        , event_date
-        , event_type
-        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
-      FROM
-      (
-        SELECT
-          person_id
-          , start_date AS event_date
-          , -1 AS event_type
-        FROM #cohort_rows
-
-        UNION ALL
-
-
-        SELECT
-          person_id
-          , DATEADD(day,0,end_date) as end_date
-          , 1 AS event_type
-        FROM #cohort_rows
-      ) RAWDATA
-    ) e
-    WHERE interval_status = 0
-  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
-	GROUP BY c.person_id, c.start_date
-) e
-group by person_id, end_date
-;
-
-DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
-INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
-select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
-FROM #final_cohort CO
-;
-
-
--- BEGIN: Censored Stats
-
-delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
-
--- END: Censored Stats
-
-
-
--- Create a temp table of inclusion rule rows for joining in the inclusion rule impact analysis
-
-select cast(rule_sequence as int) as rule_sequence
-into #inclusion_rules
-from (
-  SELECT CAST(0 as int) as rule_sequence
-) IR;
-
-
--- Find the event that is the 'best match' per person.  
--- the 'best match' is defined as the event that satisfies the most inclusion rules.
--- ties are solved by choosing the event that matches the earliest inclusion rule, and then earliest.
-
-select q.person_id, q.event_id
-into #best_events
-from #qualified_events Q
-join (
-	SELECT R.person_id, R.event_id, ROW_NUMBER() OVER (PARTITION BY R.person_id ORDER BY R.rule_count DESC,R.min_rule_id ASC, R.start_date ASC) AS rank_value
-	FROM (
-		SELECT Q.person_id, Q.event_id, COALESCE(COUNT(DISTINCT I.inclusion_rule_id), 0) AS rule_count, COALESCE(MIN(I.inclusion_rule_id), 0) AS min_rule_id, Q.start_date
-		FROM #qualified_events Q
-		LEFT JOIN #inclusion_events I ON q.person_id = i.person_id AND q.event_id = i.event_id
-		GROUP BY Q.person_id, Q.event_id, Q.start_date
-	) R
-) ranked on Q.person_id = ranked.person_id and Q.event_id = ranked.event_id
-WHERE ranked.rank_value = 1
-;
-
--- modes of generation: (the same tables store the results for the different modes, identified by the mode_id column)
--- 0: all events
--- 1: best event
-
-
--- BEGIN: Inclusion Impact Analysis - event
--- calculte matching group counts
-delete from @results_database_schema.cohort_inclusion_result where cohort_definition_id = @target_cohort_id and mode_id = 0;
-insert into @results_database_schema.cohort_inclusion_result (cohort_definition_id, inclusion_rule_mask, person_count, mode_id)
-select @target_cohort_id as cohort_definition_id, inclusion_rule_mask, count_big(*) as person_count, 0 as mode_id
-from
-(
-  select Q.person_id, Q.event_id, CAST(SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) AS bigint) as inclusion_rule_mask
-  from #qualified_events Q
-  LEFT JOIN #inclusion_events I on q.person_id = i.person_id and q.event_id = i.event_id
-  GROUP BY Q.person_id, Q.event_id
-) MG -- matching groups
-group by inclusion_rule_mask
-;
-
--- calculate gain counts 
-delete from @results_database_schema.cohort_inclusion_stats where cohort_definition_id = @target_cohort_id and mode_id = 0;
-insert into @results_database_schema.cohort_inclusion_stats (cohort_definition_id, rule_sequence, person_count, gain_count, person_total, mode_id)
-select @target_cohort_id as cohort_definition_id, ir.rule_sequence, coalesce(T.person_count, 0) as person_count, coalesce(SR.person_count, 0) gain_count, EventTotal.total, 0 as mode_id
-from #inclusion_rules ir
-left join
-(
-  select i.inclusion_rule_id, count_big(i.event_id) as person_count
-  from #qualified_events Q
-  JOIN #inclusion_events i on Q.person_id = I.person_id and Q.event_id = i.event_id
-  group by i.inclusion_rule_id
-) T on ir.rule_sequence = T.inclusion_rule_id
-CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-CROSS JOIN (select count_big(event_id) as total from #qualified_events) EventTotal
-LEFT JOIN @results_database_schema.cohort_inclusion_result SR on SR.mode_id = 0 AND SR.cohort_definition_id = @target_cohort_id AND (POWER(cast(2 as bigint),RuleTotal.total_rules) - POWER(cast(2 as bigint),ir.rule_sequence) - 1) = SR.inclusion_rule_mask -- POWER(2,rule count) - POWER(2,rule sequence) - 1 is the mask for 'all except this rule'
-;
-
--- calculate totals
-delete from @results_database_schema.cohort_summary_stats where cohort_definition_id = @target_cohort_id and mode_id = 0;
-insert into @results_database_schema.cohort_summary_stats (cohort_definition_id, base_count, final_count, mode_id)
-select @target_cohort_id as cohort_definition_id, PC.total as person_count, coalesce(FC.total, 0) as final_count, 0 as mode_id
-FROM
-(select count_big(event_id) as total from #qualified_events) PC,
-(select sum(sr.person_count) as total
-  from @results_database_schema.cohort_inclusion_result sr
-  CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-  where sr.mode_id = 0 and sr.cohort_definition_id = @target_cohort_id and sr.inclusion_rule_mask = POWER(cast(2 as bigint),RuleTotal.total_rules)-1
-) FC
-;
-
--- END: Inclusion Impact Analysis - event
-
--- BEGIN: Inclusion Impact Analysis - person
--- calculte matching group counts
-delete from @results_database_schema.cohort_inclusion_result where cohort_definition_id = @target_cohort_id and mode_id = 1;
-insert into @results_database_schema.cohort_inclusion_result (cohort_definition_id, inclusion_rule_mask, person_count, mode_id)
-select @target_cohort_id as cohort_definition_id, inclusion_rule_mask, count_big(*) as person_count, 1 as mode_id
-from
-(
-  select Q.person_id, Q.event_id, CAST(SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) AS bigint) as inclusion_rule_mask
-  from #best_events Q
-  LEFT JOIN #inclusion_events I on q.person_id = i.person_id and q.event_id = i.event_id
-  GROUP BY Q.person_id, Q.event_id
-) MG -- matching groups
-group by inclusion_rule_mask
-;
-
--- calculate gain counts 
-delete from @results_database_schema.cohort_inclusion_stats where cohort_definition_id = @target_cohort_id and mode_id = 1;
-insert into @results_database_schema.cohort_inclusion_stats (cohort_definition_id, rule_sequence, person_count, gain_count, person_total, mode_id)
-select @target_cohort_id as cohort_definition_id, ir.rule_sequence, coalesce(T.person_count, 0) as person_count, coalesce(SR.person_count, 0) gain_count, EventTotal.total, 1 as mode_id
-from #inclusion_rules ir
-left join
-(
-  select i.inclusion_rule_id, count_big(i.event_id) as person_count
-  from #best_events Q
-  JOIN #inclusion_events i on Q.person_id = I.person_id and Q.event_id = i.event_id
-  group by i.inclusion_rule_id
-) T on ir.rule_sequence = T.inclusion_rule_id
-CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-CROSS JOIN (select count_big(event_id) as total from #best_events) EventTotal
-LEFT JOIN @results_database_schema.cohort_inclusion_result SR on SR.mode_id = 1 AND SR.cohort_definition_id = @target_cohort_id AND (POWER(cast(2 as bigint),RuleTotal.total_rules) - POWER(cast(2 as bigint),ir.rule_sequence) - 1) = SR.inclusion_rule_mask -- POWER(2,rule count) - POWER(2,rule sequence) - 1 is the mask for 'all except this rule'
-;
-
--- calculate totals
-delete from @results_database_schema.cohort_summary_stats where cohort_definition_id = @target_cohort_id and mode_id = 1;
-insert into @results_database_schema.cohort_summary_stats (cohort_definition_id, base_count, final_count, mode_id)
-select @target_cohort_id as cohort_definition_id, PC.total as person_count, coalesce(FC.total, 0) as final_count, 1 as mode_id
-FROM
-(select count_big(event_id) as total from #best_events) PC,
-(select sum(sr.person_count) as total
-  from @results_database_schema.cohort_inclusion_result sr
-  CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-  where sr.mode_id = 1 and sr.cohort_definition_id = @target_cohort_id and sr.inclusion_rule_mask = POWER(cast(2 as bigint),RuleTotal.total_rules)-1
-) FC
-;
-
--- END: Inclusion Impact Analysis - person
-
-TRUNCATE TABLE #best_events;
-DROP TABLE #best_events;
-
-TRUNCATE TABLE #inclusion_rules;
-DROP TABLE #inclusion_rules;
-
-
-TRUNCATE TABLE #strategy_ends;
-DROP TABLE #strategy_ends;
-
-
-TRUNCATE TABLE #cohort_rows;
-DROP TABLE #cohort_rows;
-
-TRUNCATE TABLE #final_cohort;
-DROP TABLE #final_cohort;
-
-TRUNCATE TABLE #inclusion_events;
-DROP TABLE #inclusion_events;
-
-TRUNCATE TABLE #qualified_events;
-DROP TABLE #qualified_events;
-
-TRUNCATE TABLE #included_events;
-DROP TABLE #included_events;
-
-TRUNCATE TABLE #Codesets;
-DROP TABLE #Codesets;
-","{
-	""cdmVersionRange"" : "">=5.0.0"",
-	""PrimaryCriteria"" : {
-		""CriteriaList"" : [
-			{
-				""ConditionOccurrence"" : {
-					""CodesetId"" : 2
-				}
-			}
-		],
-		""ObservationWindow"" : {
-			""PriorDays"" : 0,
-			""PostDays"" : 0
-		},
-		""PrimaryCriteriaLimit"" : {
-			""Type"" : ""All""
-		}
-	},
-	""ConceptSets"" : [
-		{
-			""id"" : 1,
-			""name"" : ""Inpatient or Inpatient/ER visit"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 262,
-							""CONCEPT_NAME"" : ""Emergency Room and Inpatient Visit"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""ERIP"",
-							""DOMAIN_ID"" : ""Visit"",
-							""VOCABULARY_ID"" : ""Visit"",
-							""CONCEPT_CLASS_ID"" : ""Visit""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 9201,
-							""CONCEPT_NAME"" : ""Inpatient Visit"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""IP"",
-							""DOMAIN_ID"" : ""Visit"",
-							""VOCABULARY_ID"" : ""Visit"",
-							""CONCEPT_CLASS_ID"" : ""Visit""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		},
-		{
-			""id"" : 2,
-			""name"" : ""Myocardial Infarction and complication"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4329847,
-							""CONCEPT_NAME"" : ""Myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""22298006"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4108680,
-							""CONCEPT_NAME"" : ""Thrombosis of atrium, auricular appendage, and ventricle due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""194868001"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4108678,
-							""CONCEPT_NAME"" : ""Hemopericardium due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""194862000"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 438172,
-							""CONCEPT_NAME"" : ""Atrial septal defect due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""194863005"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4124687,
-							""CONCEPT_NAME"" : ""Cardiac rupture due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""233847009"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 45766212,
-							""CONCEPT_NAME"" : ""Mitral valve regurgitation due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""703326006"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 37109910,
-							""CONCEPT_NAME"" : ""Ventricular aneurysm due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""723858002"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 37109911,
-							""CONCEPT_NAME"" : ""Pulmonary embolism due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""723859005"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 37109912,
-							""CONCEPT_NAME"" : ""Arrhythmia due to and following acute myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""723860000"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 314666,
-							""CONCEPT_NAME"" : ""Old myocardial infarction"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""1755008"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : true,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		}
-	],
-	""QualifiedLimit"" : {
-		""Type"" : ""All""
-	},
-	""ExpressionLimit"" : {
-		""Type"" : ""All""
-	},
-	""InclusionRules"" : [
-		{
-			""name"" : ""has no events in prior 'clean window' - 365 days"",
-			""expression"" : {
-				""Type"" : ""ALL"",
-				""CriteriaList"" : [
-					{
-						""Criteria"" : {
-							""ConditionOccurrence"" : {
-								""CodesetId"" : 2
-							}
-						},
-						""StartWindow"" : {
-							""Start"" : {
-								""Days"" : 365,
-								""Coeff"" : -1
-							},
-							""End"" : {
-								""Days"" : 1,
-								""Coeff"" : -1
-							},
-							""UseIndexEnd"" : false,
-							""UseEventEnd"" : false
-						},
-						""RestrictVisit"" : false,
-						""IgnoreObservationPeriod"" : true,
-						""Occurrence"" : {
-							""Type"" : 0,
-							""Count"" : 0,
-							""IsDistinct"" : false
-						}
-					}
-				],
-				""DemographicCriteriaList"" : [],
-				""Groups"" : []
-			}
-		}
-	],
-	""EndStrategy"" : {
-		""DateOffset"" : {
-			""DateField"" : ""StartDate"",
-			""Offset"" : 1
-		}
-	},
-	""CensoringCriteria"" : [],
-	""CollapseSettings"" : {
-		""CollapseType"" : ""ERA"",
-		""EraPad"" : 0
-	},
-	""CensorWindow"" : {}
-}","
-",TRUE
-19059,19059,[OHDSItutorial] Diarrhea events,"CREATE TABLE #Codesets (
-  codeset_id int NOT NULL,
-  concept_id bigint NOT NULL
-)
-;
-
-INSERT INTO #Codesets (codeset_id, concept_id)
-SELECT 0 as codeset_id, c.concept_id FROM (select distinct I.concept_id FROM
-( 
-  select concept_id from @vocabulary_database_schema.CONCEPT where concept_id in (196523,80141,4101468)
-UNION  select c.concept_id
-  from @vocabulary_database_schema.CONCEPT c
-  join @vocabulary_database_schema.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
-  and ca.ancestor_concept_id in (196523,80141,4101468)
-  and c.invalid_reason is null
-
-) I
-) C;
-
-UPDATE STATISTICS #Codesets;
-
-
-SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, visit_occurrence_id
-INTO #qualified_events
-FROM 
-(
-  select pe.event_id, pe.person_id, pe.start_date, pe.end_date, pe.op_start_date, pe.op_end_date, row_number() over (partition by pe.person_id order by pe.start_date ASC) as ordinal, cast(pe.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM (-- Begin Primary Events
-select P.ordinal as event_id, P.person_id, P.start_date, P.end_date, op_start_date, op_end_date, cast(P.visit_occurrence_id as bigint) as visit_occurrence_id
-FROM
-(
-  select E.person_id, E.start_date, E.end_date,
-         row_number() OVER (PARTITION BY E.person_id ORDER BY E.sort_date ASC, E.event_id) ordinal,
-         OP.observation_period_start_date as op_start_date, OP.observation_period_end_date as op_end_date, cast(E.visit_occurrence_id as bigint) as visit_occurrence_id
-  FROM 
-  (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 0)
-) C
-
-
--- End Condition Occurrence Criteria
-
-  ) E
-	JOIN @cdm_database_schema.observation_period OP on E.person_id = OP.person_id and E.start_date >=  OP.observation_period_start_date and E.start_date <= op.observation_period_end_date
-  WHERE DATEADD(day,0,OP.OBSERVATION_PERIOD_START_DATE) <= E.START_DATE AND DATEADD(day,0,E.START_DATE) <= OP.OBSERVATION_PERIOD_END_DATE
-) P
-
--- End Primary Events
-) pe
-  
-) QE
-
-;
-
---- Inclusion Rule Inserts
-
-select 0 as inclusion_rule_id, person_id, event_id
-INTO #Inclusion_0
-FROM 
-(
-  select pe.person_id, pe.event_id
-  FROM #qualified_events pe
-  
-JOIN (
--- Begin Criteria Group
-select 0 as index_id, person_id, event_id
-FROM
-(
-  select E.person_id, E.event_id 
-  FROM #qualified_events E
-  INNER JOIN
-  (
-    -- Begin Correlated Criteria
-select 0 as index_id, p.person_id, p.event_id
-from #qualified_events p
-LEFT JOIN (
-SELECT p.person_id, p.event_id 
-FROM #qualified_events P
-JOIN (
-  -- Begin Condition Occurrence Criteria
-SELECT C.person_id, C.condition_occurrence_id as event_id, C.start_date, C.end_date,
-  C.visit_occurrence_id, C.start_date as sort_date
-FROM 
-(
-  SELECT co.person_id,co.condition_occurrence_id,co.condition_concept_id,co.visit_occurrence_id,co.condition_start_date as start_date, COALESCE(co.condition_end_date, DATEADD(day,1,co.condition_start_date)) as end_date 
-  FROM @cdm_database_schema.CONDITION_OCCURRENCE co
-  JOIN #Codesets cs on (co.condition_concept_id = cs.concept_id and cs.codeset_id = 0)
-) C
-
-
--- End Condition Occurrence Criteria
-
-) A on A.person_id = P.person_id  AND A.START_DATE >= P.OP_START_DATE AND A.START_DATE <= P.OP_END_DATE AND A.START_DATE >= DATEADD(day,-30,P.START_DATE) AND A.START_DATE <= DATEADD(day,-1,P.START_DATE) ) cc on p.person_id = cc.person_id and p.event_id = cc.event_id
-GROUP BY p.person_id, p.event_id
-HAVING COUNT(cc.event_id) = 0
--- End Correlated Criteria
-
-  ) CQ on E.person_id = CQ.person_id and E.event_id = CQ.event_id
-  GROUP BY E.person_id, E.event_id
-  HAVING COUNT(index_id) = 1
-) G
--- End Criteria Group
-) AC on AC.person_id = pe.person_id AND AC.event_id = pe.event_id
-) Results
-;
-
-SELECT inclusion_rule_id, person_id, event_id
-INTO #inclusion_events
-FROM (select inclusion_rule_id, person_id, event_id from #Inclusion_0) I;
-TRUNCATE TABLE #Inclusion_0;
-DROP TABLE #Inclusion_0;
-
-
-select event_id, person_id, start_date, end_date, op_start_date, op_end_date
-into #included_events
-FROM (
-  SELECT event_id, person_id, start_date, end_date, op_start_date, op_end_date, row_number() over (partition by person_id order by start_date ASC) as ordinal
-  from
-  (
-    select Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date, SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) as inclusion_rule_mask
-    from #qualified_events Q
-    LEFT JOIN #inclusion_events I on I.person_id = Q.person_id and I.event_id = Q.event_id
-    GROUP BY Q.event_id, Q.person_id, Q.start_date, Q.end_date, Q.op_start_date, Q.op_end_date
-  ) MG -- matching groups
-
-  -- the matching group with all bits set ( POWER(2,# of inclusion rules) - 1 = inclusion_rule_mask
-  WHERE (MG.inclusion_rule_mask = POWER(cast(2 as bigint),1)-1)
-
-) Results
-
-;
-
--- date offset strategy
-
-select event_id, person_id, 
-  case when DATEADD(day,1,start_date) > op_end_date then op_end_date else DATEADD(day,1,start_date) end as end_date
-INTO #strategy_ends
-from #included_events;
-
-
--- generate cohort periods into #final_cohort
-select person_id, start_date, end_date
-INTO #cohort_rows
-from ( -- first_ends
-	select F.person_id, F.start_date, F.end_date
-	FROM (
-	  select I.event_id, I.person_id, I.start_date, CE.end_date, row_number() over (partition by I.person_id, I.event_id order by CE.end_date) as ordinal
-	  from #included_events I
-	  join ( -- cohort_ends
--- cohort exit dates
--- End Date Strategy
-SELECT event_id, person_id, end_date from #strategy_ends
-
-    ) CE on I.event_id = CE.event_id and I.person_id = CE.person_id and CE.end_date >= I.start_date
-	) F
-	WHERE F.ordinal = 1
-) FE;
-
-select person_id, min(start_date) as start_date, end_date
-into #final_cohort
-from ( --cteEnds
-	SELECT
-		 c.person_id
-		, c.start_date
-		, MIN(ed.end_date) AS end_date
-	FROM #cohort_rows c
-	JOIN ( -- cteEndDates
-    SELECT
-      person_id
-      , DATEADD(day,-1 * 0, event_date)  as end_date
-    FROM
-    (
-      SELECT
-        person_id
-        , event_date
-        , event_type
-        , SUM(event_type) OVER (PARTITION BY person_id ORDER BY event_date, event_type ROWS UNBOUNDED PRECEDING) AS interval_status
-      FROM
-      (
-        SELECT
-          person_id
-          , start_date AS event_date
-          , -1 AS event_type
-        FROM #cohort_rows
-
-        UNION ALL
-
-
-        SELECT
-          person_id
-          , DATEADD(day,0,end_date) as end_date
-          , 1 AS event_type
-        FROM #cohort_rows
-      ) RAWDATA
-    ) e
-    WHERE interval_status = 0
-  ) ed ON c.person_id = ed.person_id AND ed.end_date >= c.start_date
-	GROUP BY c.person_id, c.start_date
-) e
-group by person_id, end_date
-;
-
-DELETE FROM @target_database_schema.@target_cohort_table where cohort_definition_id = @target_cohort_id;
-INSERT INTO @target_database_schema.@target_cohort_table (cohort_definition_id, subject_id, cohort_start_date, cohort_end_date)
-select @target_cohort_id as cohort_definition_id, person_id, start_date, end_date 
-FROM #final_cohort CO
-;
-
-
--- BEGIN: Censored Stats
-
-delete from @results_database_schema.cohort_censor_stats where cohort_definition_id = @target_cohort_id;
-
--- END: Censored Stats
-
-
-
--- Create a temp table of inclusion rule rows for joining in the inclusion rule impact analysis
-
-select cast(rule_sequence as int) as rule_sequence
-into #inclusion_rules
-from (
-  SELECT CAST(0 as int) as rule_sequence
-) IR;
-
-
--- Find the event that is the 'best match' per person.  
--- the 'best match' is defined as the event that satisfies the most inclusion rules.
--- ties are solved by choosing the event that matches the earliest inclusion rule, and then earliest.
-
-select q.person_id, q.event_id
-into #best_events
-from #qualified_events Q
-join (
-	SELECT R.person_id, R.event_id, ROW_NUMBER() OVER (PARTITION BY R.person_id ORDER BY R.rule_count DESC,R.min_rule_id ASC, R.start_date ASC) AS rank_value
-	FROM (
-		SELECT Q.person_id, Q.event_id, COALESCE(COUNT(DISTINCT I.inclusion_rule_id), 0) AS rule_count, COALESCE(MIN(I.inclusion_rule_id), 0) AS min_rule_id, Q.start_date
-		FROM #qualified_events Q
-		LEFT JOIN #inclusion_events I ON q.person_id = i.person_id AND q.event_id = i.event_id
-		GROUP BY Q.person_id, Q.event_id, Q.start_date
-	) R
-) ranked on Q.person_id = ranked.person_id and Q.event_id = ranked.event_id
-WHERE ranked.rank_value = 1
-;
-
--- modes of generation: (the same tables store the results for the different modes, identified by the mode_id column)
--- 0: all events
--- 1: best event
-
-
--- BEGIN: Inclusion Impact Analysis - event
--- calculte matching group counts
-delete from @results_database_schema.cohort_inclusion_result where cohort_definition_id = @target_cohort_id and mode_id = 0;
-insert into @results_database_schema.cohort_inclusion_result (cohort_definition_id, inclusion_rule_mask, person_count, mode_id)
-select @target_cohort_id as cohort_definition_id, inclusion_rule_mask, count_big(*) as person_count, 0 as mode_id
-from
-(
-  select Q.person_id, Q.event_id, CAST(SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) AS bigint) as inclusion_rule_mask
-  from #qualified_events Q
-  LEFT JOIN #inclusion_events I on q.person_id = i.person_id and q.event_id = i.event_id
-  GROUP BY Q.person_id, Q.event_id
-) MG -- matching groups
-group by inclusion_rule_mask
-;
-
--- calculate gain counts 
-delete from @results_database_schema.cohort_inclusion_stats where cohort_definition_id = @target_cohort_id and mode_id = 0;
-insert into @results_database_schema.cohort_inclusion_stats (cohort_definition_id, rule_sequence, person_count, gain_count, person_total, mode_id)
-select @target_cohort_id as cohort_definition_id, ir.rule_sequence, coalesce(T.person_count, 0) as person_count, coalesce(SR.person_count, 0) gain_count, EventTotal.total, 0 as mode_id
-from #inclusion_rules ir
-left join
-(
-  select i.inclusion_rule_id, count_big(i.event_id) as person_count
-  from #qualified_events Q
-  JOIN #inclusion_events i on Q.person_id = I.person_id and Q.event_id = i.event_id
-  group by i.inclusion_rule_id
-) T on ir.rule_sequence = T.inclusion_rule_id
-CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-CROSS JOIN (select count_big(event_id) as total from #qualified_events) EventTotal
-LEFT JOIN @results_database_schema.cohort_inclusion_result SR on SR.mode_id = 0 AND SR.cohort_definition_id = @target_cohort_id AND (POWER(cast(2 as bigint),RuleTotal.total_rules) - POWER(cast(2 as bigint),ir.rule_sequence) - 1) = SR.inclusion_rule_mask -- POWER(2,rule count) - POWER(2,rule sequence) - 1 is the mask for 'all except this rule'
-;
-
--- calculate totals
-delete from @results_database_schema.cohort_summary_stats where cohort_definition_id = @target_cohort_id and mode_id = 0;
-insert into @results_database_schema.cohort_summary_stats (cohort_definition_id, base_count, final_count, mode_id)
-select @target_cohort_id as cohort_definition_id, PC.total as person_count, coalesce(FC.total, 0) as final_count, 0 as mode_id
-FROM
-(select count_big(event_id) as total from #qualified_events) PC,
-(select sum(sr.person_count) as total
-  from @results_database_schema.cohort_inclusion_result sr
-  CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-  where sr.mode_id = 0 and sr.cohort_definition_id = @target_cohort_id and sr.inclusion_rule_mask = POWER(cast(2 as bigint),RuleTotal.total_rules)-1
-) FC
-;
-
--- END: Inclusion Impact Analysis - event
-
--- BEGIN: Inclusion Impact Analysis - person
--- calculte matching group counts
-delete from @results_database_schema.cohort_inclusion_result where cohort_definition_id = @target_cohort_id and mode_id = 1;
-insert into @results_database_schema.cohort_inclusion_result (cohort_definition_id, inclusion_rule_mask, person_count, mode_id)
-select @target_cohort_id as cohort_definition_id, inclusion_rule_mask, count_big(*) as person_count, 1 as mode_id
-from
-(
-  select Q.person_id, Q.event_id, CAST(SUM(coalesce(POWER(cast(2 as bigint), I.inclusion_rule_id), 0)) AS bigint) as inclusion_rule_mask
-  from #best_events Q
-  LEFT JOIN #inclusion_events I on q.person_id = i.person_id and q.event_id = i.event_id
-  GROUP BY Q.person_id, Q.event_id
-) MG -- matching groups
-group by inclusion_rule_mask
-;
-
--- calculate gain counts 
-delete from @results_database_schema.cohort_inclusion_stats where cohort_definition_id = @target_cohort_id and mode_id = 1;
-insert into @results_database_schema.cohort_inclusion_stats (cohort_definition_id, rule_sequence, person_count, gain_count, person_total, mode_id)
-select @target_cohort_id as cohort_definition_id, ir.rule_sequence, coalesce(T.person_count, 0) as person_count, coalesce(SR.person_count, 0) gain_count, EventTotal.total, 1 as mode_id
-from #inclusion_rules ir
-left join
-(
-  select i.inclusion_rule_id, count_big(i.event_id) as person_count
-  from #best_events Q
-  JOIN #inclusion_events i on Q.person_id = I.person_id and Q.event_id = i.event_id
-  group by i.inclusion_rule_id
-) T on ir.rule_sequence = T.inclusion_rule_id
-CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-CROSS JOIN (select count_big(event_id) as total from #best_events) EventTotal
-LEFT JOIN @results_database_schema.cohort_inclusion_result SR on SR.mode_id = 1 AND SR.cohort_definition_id = @target_cohort_id AND (POWER(cast(2 as bigint),RuleTotal.total_rules) - POWER(cast(2 as bigint),ir.rule_sequence) - 1) = SR.inclusion_rule_mask -- POWER(2,rule count) - POWER(2,rule sequence) - 1 is the mask for 'all except this rule'
-;
-
--- calculate totals
-delete from @results_database_schema.cohort_summary_stats where cohort_definition_id = @target_cohort_id and mode_id = 1;
-insert into @results_database_schema.cohort_summary_stats (cohort_definition_id, base_count, final_count, mode_id)
-select @target_cohort_id as cohort_definition_id, PC.total as person_count, coalesce(FC.total, 0) as final_count, 1 as mode_id
-FROM
-(select count_big(event_id) as total from #best_events) PC,
-(select sum(sr.person_count) as total
-  from @results_database_schema.cohort_inclusion_result sr
-  CROSS JOIN (select count(*) as total_rules from #inclusion_rules) RuleTotal
-  where sr.mode_id = 1 and sr.cohort_definition_id = @target_cohort_id and sr.inclusion_rule_mask = POWER(cast(2 as bigint),RuleTotal.total_rules)-1
-) FC
-;
-
--- END: Inclusion Impact Analysis - person
-
-TRUNCATE TABLE #best_events;
-DROP TABLE #best_events;
-
-TRUNCATE TABLE #inclusion_rules;
-DROP TABLE #inclusion_rules;
-
-
-TRUNCATE TABLE #strategy_ends;
-DROP TABLE #strategy_ends;
-
-
-TRUNCATE TABLE #cohort_rows;
-DROP TABLE #cohort_rows;
-
-TRUNCATE TABLE #final_cohort;
-DROP TABLE #final_cohort;
-
-TRUNCATE TABLE #inclusion_events;
-DROP TABLE #inclusion_events;
-
-TRUNCATE TABLE #qualified_events;
-DROP TABLE #qualified_events;
-
-TRUNCATE TABLE #included_events;
-DROP TABLE #included_events;
-
-TRUNCATE TABLE #Codesets;
-DROP TABLE #Codesets;
-","{
-	""cdmVersionRange"" : "">=5.0.0"",
-	""PrimaryCriteria"" : {
-		""CriteriaList"" : [
-			{
-				""ConditionOccurrence"" : {
-					""CodesetId"" : 0
-				}
-			}
-		],
-		""ObservationWindow"" : {
-			""PriorDays"" : 0,
-			""PostDays"" : 0
-		},
-		""PrimaryCriteriaLimit"" : {
-			""Type"" : ""All""
-		}
-	},
-	""ConceptSets"" : [
-		{
-			""id"" : 0,
-			""name"" : ""[OHDSItutorial] Diarrhea"",
-			""expression"" : {
-				""items"" : [
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 196523,
-							""CONCEPT_NAME"" : ""Diarrhea"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""62315008"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Clinical Finding""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 80141,
-							""CONCEPT_NAME"" : ""Functional diarrhea"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""47812002"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Disorder""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					},
-					{
-						""concept"" : {
-							""CONCEPT_ID"" : 4101468,
-							""CONCEPT_NAME"" : ""Gastroenteritis"",
-							""STANDARD_CONCEPT"" : ""S"",
-							""STANDARD_CONCEPT_CAPTION"" : ""Standard"",
-							""INVALID_REASON"" : ""V"",
-							""INVALID_REASON_CAPTION"" : ""Valid"",
-							""CONCEPT_CODE"" : ""25374005"",
-							""DOMAIN_ID"" : ""Condition"",
-							""VOCABULARY_ID"" : ""SNOMED"",
-							""CONCEPT_CLASS_ID"" : ""Disorder""
-						},
-						""isExcluded"" : false,
-						""includeDescendants"" : true,
-						""includeMapped"" : false
-					}
-				]
-			}
-		}
-	],
-	""QualifiedLimit"" : {
-		""Type"" : ""First""
-	},
-	""ExpressionLimit"" : {
-		""Type"" : ""All""
-	},
-	""InclusionRules"" : [
-		{
-			""name"" : ""no diarrhea in prior 30 days"",
-			""expression"" : {
-				""Type"" : ""ALL"",
-				""CriteriaList"" : [
-					{
-						""Criteria"" : {
-							""ConditionOccurrence"" : {
-								""CodesetId"" : 0
-							}
-						},
-						""StartWindow"" : {
-							""Start"" : {
-								""Days"" : 30,
-								""Coeff"" : -1
-							},
-							""End"" : {
-								""Days"" : 1,
-								""Coeff"" : -1
-							},
-							""UseIndexEnd"" : false,
-							""UseEventEnd"" : false
-						},
-						""RestrictVisit"" : false,
-						""IgnoreObservationPeriod"" : false,
-						""Occurrence"" : {
-							""Type"" : 0,
-							""Count"" : 0,
-							""IsDistinct"" : false
-						}
-					}
-				],
-				""DemographicCriteriaList"" : [],
-				""Groups"" : []
-			}
-		}
-	],
-	""EndStrategy"" : {
-		""DateOffset"" : {
-			""DateField"" : ""StartDate"",
-			""Offset"" : 1
-		}
-	},
-	""CensoringCriteria"" : [],
-	""CollapseSettings"" : {
-		""CollapseType"" : ""ERA"",
-		""EraPad"" : 0
-	},
-	""CensorWindow"" : {}
-}",NA,TRUE

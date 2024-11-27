@@ -25,9 +25,9 @@ cohortDefinitionSet <- readr::read_csv("inst/Cohorts.csv", show_col_types = FALS
 tcis <- list(
   #standard analyses that would be performed during routine signal detection
   list(
-    targetId = 19020, # New users of GPLT-1
-    comparatorId = 19021, # New users of DPP-4
-    indicationId = 19022, # Type 2 diabetes
+    targetId = 19025, # ACE inhibitors
+    comparatorId = 19027, # Thiazides and thiazide-like diuretics
+    indicationId = 19026, # Hypertension
     genderConceptIds = c(8507, 8532), # use valid genders (remove unknown)
     minAge = NULL, # All ages In years. Can be NULL
     maxAge = NULL, # All ages In years. Can be NULL
@@ -36,11 +36,9 @@ tcis <- list(
 )
 
 outcomes <- tibble(
-  cohortId = c(19023, # Acute myocardial infarction inpatient setting
-               19024, # Acute myocardial infarction any setting
-               19059), # Diarrhea
-  cleanWindow = c(365,
-                  365,
+  cohortId = c(19028, # Angioedema
+               19029), # Acute myocardial infarction 
+  cleanWindow = c(180,
                   365)
 )
 

@@ -19,11 +19,11 @@ options(andromedaTempFolder = "e:/andromedaTemp") # Where temp Andromeda files w
 
 ##=========== START OF INPUTS ==========
 options(sqlRenderTempEmulationSchema = "scratch.scratch_mschuemi") # For database platforms that don't support temp tables
-cdmDatabaseSchema <- "merative_ccae.cdm_merative_ccae_v3046" # The database / schema where the data in CDM format live
+cdmDatabaseSchema <- "optum_ehr.cdm_optum_ehr_v3037" # The database / schema where the data in CDM format live
 workDatabaseSchema <- "scratch.scratch_mschuemi" # A database /schema where study tables can be written
-cohortTableName <- "example_strategus_study_ccae" # Where the cohorts will be written
+cohortTableName <- "example_strategus_study_optum_ehr" # Where the cohorts will be written
 outputLocation <- "e:/exampleStrategusStudy" # Where the intermediate and output files will be written
-databaseName <- "CCAE" # Only used as a folder name for results from the study
+databaseName <- "Optum EHR" # Only used as a folder name for results from the study
 minCellCount <- 5 # Minimum cell count for inclusion in output tables
 
 
