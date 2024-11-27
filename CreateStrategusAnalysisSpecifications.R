@@ -75,6 +75,7 @@ studyEndDate <- "20231231"   #YYYYMMDD
 # Consider these settings for estimation  ----------------------------------------
 useCleanWindowForPriorOutcomeLookback <- FALSE # If FALSE, lookback window is all time prior, i.e., including only first events
 psMatchMaxRatio <- 1 # If bigger than 1, the outcome model will be conditioned on the matched set
+sccsMaxCasesPerOutcome <- 100000 
 
 ########################################################
 # Below the line - DO NOT MODIFY -----------------------
@@ -502,7 +503,7 @@ analysisToInclude <- data.frame()
 for (i in seq_len(nrow(uniqueTargetIndications))) {
   targetIndication <- uniqueTargetIndications[i, ]
   getDbSccsDataArgs <- SelfControlledCaseSeries::createGetDbSccsDataArgs(
-    maxCasesPerOutcome = 1000000,
+    maxCasesPerOutcome = sccsMaxCasesPerOutcome,
     useNestingCohort = !is.na(targetIndication$indicationId),
     nestingCohortId = targetIndication$indicationId,
     studyStartDate = studyStartDate,
@@ -674,12 +675,12 @@ analysisSpecifications <- Strategus::createEmptyAnalysisSpecificiations() |>
   Strategus::addSharedResources(cohortDefinitionShared) |> 
   Strategus::addSharedResources(negativeControlsShared) |>
   Strategus::addModuleSpecifications(cohortGeneratorModuleSpecifications) |>
-  Strategus::addModuleSpecifications(cohortDiagnosticsModuleSpecifications) |>
+  # Strategus::addModuleSpecifications(cohortDiagnosticsModuleSpecifications) |>
   Strategus::addModuleSpecifications(characterizationModuleSpecifications) |>
   Strategus::addModuleSpecifications(cohortIncidenceModuleSpecifications) |>
   Strategus::addModuleSpecifications(cohortMethodModuleSpecifications) |>
-  Strategus::addModuleSpecifications(selfControlledModuleSpecifications) |>
-  Strategus::addModuleSpecifications(plpModuleSpecifications)
+  Strategus::addModuleSpecifications(selfControlledModuleSpecifications) # |>
+  # Strategus::addModuleSpecifications(plpModuleSpecifications)
 
 ParallelLogger::saveSettingsToJson(
   analysisSpecifications, 
